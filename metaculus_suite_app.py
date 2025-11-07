@@ -513,7 +513,7 @@ def run_comment_scorer():
     with colA:
         mode = st.radio("Mode", ["Score recent questions", "Score specific IDs", "By commenter ID", "By tournament URL/slug"], horizontal=True)
     with colB:
-        if st.button("🔁 Appuyer ici pour un nouveau run", key="newrun_score_top"):
+        if st.button("🔁 Press here for a new run", key="newrun_score_top"):
             start_new_run()
 
     model_choice = _resolve_model_from_sidebar("DEFAULT")
