@@ -137,6 +137,57 @@ def pick_model(user_choice: Optional[str] = None) -> str:
             return best_id
     return PREFERRED_MODELS[0]
 
+def _resolve_model_from_sidebar(base_key: str, fallback: Optional[str] = None) -> str:
+    """
+    Read model selection from sidebar controls:
+    - prefer custom text field (MODEL_<BASE>_CUSTOM) if nonempty
+    - else use dropdown (MODEL_<BASE>)
+    - else fallback -> pick_model()
+    """
+    custom_key = f"MODEL_{base_key}_CUSTOM"
+    dd_key = f"MODEL_{base_key}"
+    custom = st.session_state.get(custom_key, "")
+    if isinstance(custom, str) and custom.strip():
+        return custom.strip()
+    dd = st.session_state.get(dd_key, "")
+    if isinstance(dd, str) and dd.strip():
+        return dd.strip()
+    return pick_model(fallback)
+
+def call_openrouter(messages: List[Dict[str, str]], model: str, max_tokens: int = 1200, temperature: float = 0.0, retries: int = 3, expect: str = "auto", title_hint: str = "Metaculus Suite", ua_hint: str = "metaculus-suite/1.0") -> Any:
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "top_p": 1,
+        "max_tokens": max_tokens,
+    }
+    last = None
+    for k in range(retries):
+        try:
+            r = requests.post(OPENROUTER_URL, headers=or_headers(title_hint, user_agent=ua_hint), json=payload, timeout=120)
+            if r.status_code == 404:
+                raise RuntimeError("404 No endpoints for model")
+            if r.status_code == 429:
+                retry_after = float(r.headers.get("Retry-After", "2") or 2)
+                time.sleep(min(retry_after, 10))
+                continue
+            r.raise_for_status()
+            data = r.json()
+            if "error" in data:
+                raise RuntimeError(str(data["error"]))
+            ch = data.get("choices") or []
+            if not ch:
+                raise RuntimeError("No choices in response")
+            content = ch[0].get("message", {}).get("content", "")
+            if not content:
+                raise RuntimeError("Empty content")
+            return parse_json_relaxed(content, expect=expect)
+        except Exception as e:
+            last = e
+            time.sleep(0.7 * (k + 1))
+    raise RuntimeError(f"[openrouter] giving up after retries: {repr(last)}")
+
 def parse_json_relaxed(s: str, expect: str = "auto") -> Any:
     s = s.strip()
     try:
@@ -184,40 +235,6 @@ def parse_json_relaxed(s: str, expect: str = "auto") -> Any:
     if objs:
         return objs if len(objs)>1 else objs[0]
     raise ValueError("Could not parse JSON from model output")
-
-def call_openrouter(messages: List[Dict[str, str]], model: str, max_tokens: int = 1200, temperature: float = 0.0, retries: int = 3, expect: str = "auto", title_hint: str = "Metaculus Suite", ua_hint: str = "metaculus-suite/1.0") -> Any:
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "top_p": 1,
-        "max_tokens": max_tokens,
-    }
-    last = None
-    for k in range(retries):
-        try:
-            r = requests.post(OPENROUTER_URL, headers=or_headers(title_hint, user_agent=ua_hint), json=payload, timeout=120)
-            if r.status_code == 404:
-                raise RuntimeError("404 No endpoints for model")
-            if r.status_code == 429:
-                retry_after = float(r.headers.get("Retry-After", "2") or 2)
-                time.sleep(min(retry_after, 10))
-                continue
-            r.raise_for_status()
-            data = r.json()
-            if "error" in data:
-                raise RuntimeError(str(data["error"]))
-            ch = data.get("choices") or []
-            if not ch:
-                raise RuntimeError("No choices in response")
-            content = ch[0].get("message", {}).get("content", "")
-            if not content:
-                raise RuntimeError("Empty content")
-            return parse_json_relaxed(content, expect=expect)
-        except Exception as e:
-            last = e
-            time.sleep(0.7 * (k + 1))
-    raise RuntimeError(f"[openrouter] giving up after retries: {repr(last)}")
 
 def start_new_run():
     for k in list(st.session_state.keys()):
@@ -368,10 +385,8 @@ def run_comment_scorer():
         if st.button("🧹 Start a new run"):
             start_new_run()
 
-    models = list_models_clean()
-    model_ids = [m.get("id") for m in models if m.get("id")]
-    default_model = pick_model(None)
-    model_choice = st.selectbox("OpenRouter model for scoring", options=(model_ids or [default_model]), index=(model_ids or [default_model]).index(default_model) if (model_ids or [default_model]) else 0)
+    # Use sidebar default model (or its custom override)
+    model_choice = _resolve_model_from_sidebar("DEFAULT")
 
     comments_limit = st.number_input("Max comments per question", min_value=10, max_value=500, value=120, step=10)
 
@@ -390,7 +405,7 @@ def run_comment_scorer():
     if st.button("▶️ Run scoring", type="primary"):
         rows: List[Dict[str, Any]] = []
         try:
-            model = pick_model(model_choice)
+            model = model_choice
             if mode == "Score recent questions":
                 subjects = fetch_recent_questions(n_subjects=int(n), page_limit=80)
             else:
@@ -412,7 +427,10 @@ def run_comment_scorer():
                         if not text: continue
                         a = c.get("author") or {}
                         resp = score_with_llm(s["title"], s["url"], c, model)
-                        score = int(max(1, min(5, round(float(resp.get('score', 3))))))
+                        try:
+                            score = int(max(1, min(5, round(float(resp.get('score', 3))))))
+                        except Exception:
+                            score = 3
                         rows.append(
                             {
                                 "poster_id": a.get("id"),
@@ -597,10 +615,8 @@ def run_question_factors():
         if st.button("🧹 Start a new run"):
             start_new_run()
 
-    models = list_models_clean()
-    model_ids = [m.get("id") for m in models if m.get("id")]
-    default_model = pick_model(None)
-    model_choice = st.selectbox("OpenRouter model", options=(model_ids or [default_model]), index=(model_ids or [default_model]).index(default_model) if (model_ids or [default_model]) else 0)
+    # Use sidebar default model
+    model_choice = _resolve_model_from_sidebar("DEFAULT")
 
     if mode == "Recent questions":
         n = st.number_input("How many recent questions?", min_value=1, max_value=50, value=3, step=1)
@@ -609,7 +625,7 @@ def run_question_factors():
 
     if st.button("▶️ Generate factors", type="primary"):
         try:
-            used_model = pick_model(model_choice)
+            used_model = model_choice
             if mode == "Recent questions":
                 subjects = fetch_recent_questions(n_subjects=int(n), page_limit=80)
             else:
@@ -705,12 +721,6 @@ A:
 B:
 {B}
 """
-
-def extract_code_fence(s: str) -> Optional[str]:
-    m = re.search(r"```(?:json)?\s*(.*?)\s*```", s, flags=re.DOTALL | re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    return None
 
 def load_examples_csv(path: str, k_good: int = 3, k_bad: int = 2) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     if not path or not os.path.exists(path):
@@ -833,20 +843,10 @@ def run_question_generator():
     st.subheader("🧪 AI Question Generator")
     st.caption("Generate, critique, judge and rank Metaculus-style questions. Export CSV & JSONL.")
 
-    # Controls
-    with st.expander("🔐 API & Models", expanded=True):
-        api_key_input = st.text_input("OpenRouter API key", type="password", help="Kept only in this session.")
-        if api_key_input:
-            st.session_state["OPENROUTER_API_KEY_OVERRIDE"] = api_key_input.strip()
-        # Model selectors
-        models = list_models_clean()
-        model_ids = [m.get("id") for m in models if m.get("id")]
-        default = pick_model(None)
-        col1, col2, col3 = st.columns(3)
-        gen_model  = col1.selectbox("Generator model", options=(model_ids or [default]), index=(model_ids or [default]).index(default) if (model_ids or [default]) else 0)
-        crit_model = col2.selectbox("Critique model",  options=(model_ids or [default]), index=(model_ids or [default]).index(default) if (model_ids or [default]) else 0)
-        judge_model= col3.selectbox("Judge model",     options=(model_ids or [default]), index=(model_ids or [default]).index(default) if (model_ids or [default]) else 0)
-        st.button("🔄 Refresh model list", on_click=lambda: list_models_clean.clear())
+    # Read models from sidebar
+    gen_model  = _resolve_model_from_sidebar("GEN")
+    crit_model = _resolve_model_from_sidebar("CRIT")
+    judge_model= _resolve_model_from_sidebar("JUDGE")
 
     c1, c2, c3 = st.columns([2,1,1])
     with c1:
@@ -871,7 +871,6 @@ def run_question_generator():
             examples_path = None
             if scrape_n > 0:
                 try:
-                    # quick scrape using shared fetcher, then write to temp csv
                     qs = fetch_recent_questions(n_subjects=max(10, scrape_n), page_limit=max(80, scrape_n))
                     fieldnames = ["id","url","title","body","resolution_criteria","timeframe","answer_type"]
                     fd, path = tempfile.mkstemp(suffix=".csv"); os.close(fd)
@@ -981,37 +980,55 @@ st.set_page_config(page_title="Metaculus Suite (Comments • Q-Gen • Factors)"
 st.title("🔮 Metaculus Suite — Comments • Question Generation • Factors")
 
 with st.sidebar:
-    st.header("🔐 Credentials")
-    current_key = get_openrouter_key()
-    st.info("OPENROUTER_API_KEY detected." if current_key else "Enter your OpenRouter API key below or set it in Secrets/env.")
-    api_key_input = st.text_input("OpenRouter API key (overrides env/secrets)", type="password")
+    st.header("🔐 API & Models")
+
+    # API key (session override)
+    st.caption("Enter your OpenRouter key here. It overrides env/secrets for this session.")
+    api_key_input = st.text_input("OpenRouter API key", type="password", key="OPENROUTER_API_KEY_SIDEBAR")
     if api_key_input:
         st.session_state["OPENROUTER_API_KEY_OVERRIDE"] = api_key_input.strip()
 
-    st.header("🧠 Model utilities")
-    if st.button("List available models"):
-        try:
-            models = list_models_clean()
-            if not models:
-                st.warning("No models visible (invalid key or no access).")
-            else:
-                dfm = pd.DataFrame(
-                    [{
-                        "id": x.get("id"),
-                        "context_length": x.get("context_length"),
-                        "pricing_in": (x.get("pricing") or {}).get("prompt") or (x.get("pricing") or {}).get("input"),
-                        "pricing_out": (x.get("pricing") or {}).get("completion") or (x.get("pricing") or {}).get("output"),
-                        "tags": ", ".join(x.get("tags") or []),
-                    } for x in models]
-                )
-                st.dataframe(dfm, use_container_width=True, height=300)
-        except Exception as e:
-            st.error(f"Error while fetching models: {e}")
-    st.button("🔄 Refresh model cache", on_click=lambda: list_models_clean.clear())
-
-    st.header("🧹 Session")
-    if st.button("Reset all state"):
+    cols = st.columns([1,1])
+    if cols[0].button("🔄 Refresh model list", use_container_width=True):
+        list_models_clean.clear()
+    if cols[1].button("🧹 Reset all state", use_container_width=True):
         start_new_run()
+
+    try:
+        models = list_models_clean()
+    except Exception:
+        models = []
+    model_ids = sorted([m.get("id") for m in models if m.get("id")]) or []
+    default_model_id = pick_model(None)
+
+    st.divider()
+    st.subheader("Defaults (Scorer & Factors)")
+    st.selectbox(
+        "Default model",
+        options=model_ids or [default_model_id],
+        index=(model_ids or [default_model_id]).index(default_model_id) if (model_ids or [default_model_id]) else 0,
+        key="MODEL_DEFAULT",
+        help="Used by Comment Scorer and Question Factors unless a custom model ID is set below."
+    )
+    st.text_input("Custom model ID (optional)", key="MODEL_DEFAULT_CUSTOM", placeholder="e.g., openai/gpt-4.1 or anthropic/claude-3.5-sonnet")
+
+    st.divider()
+    st.subheader("Question Generator models")
+    c1, c2, c3 = st.columns(3)
+    c1.selectbox("Generator", options=model_ids or [default_model_id],
+                 index=(model_ids or [default_model_id]).index(default_model_id) if (model_ids or [default_model_id]) else 0,
+                 key="MODEL_GEN")
+    c2.selectbox("Critique",  options=model_ids or [default_model_id],
+                 index=(model_ids or [default_model_id]).index(default_model_id) if (model_ids or [default_model_id]) else 0,
+                 key="MODEL_CRIT")
+    c3.selectbox("Judge",     options=model_ids or [default_model_id],
+                 index=(model_ids or [default_model_id]).index(default_model_id) if (model_ids or [default_model_id]) else 0,
+                 key="MODEL_JUDGE")
+    c1.text_input("Custom generator ID", key="MODEL_GEN_CUSTOM", placeholder="Optional override")
+    c2.text_input("Custom critique ID",  key="MODEL_CRIT_CUSTOM", placeholder="Optional override")
+    c3.text_input("Custom judge ID",     key="MODEL_JUDGE_CUSTOM", placeholder="Optional override")
+
+    st.caption("Tip: custom IDs let you call any model you have access to, even if it isn't listed.")
 
 mode = st.radio("Choose a module", ["Comment Scorer", "Question Generator", "Question Factors"], horizontal=True)
 
@@ -1021,5 +1038,4 @@ elif mode == "Question Generator":
     run_question_generator()
 else:
     run_question_factors()
-
-st.caption("Tip: add OPENROUTER_API_KEY in app secrets (Settings → Secrets) or enter it here. This app calls Metaculus public APIs and OpenRouter.")
+st.caption("Tip:add OPENROUTER_API_KEY in app secrets (Settings → Secrets) or enter it here. This app calls Metaculus public APIs and OpenRouter.")
