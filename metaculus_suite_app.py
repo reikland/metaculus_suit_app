@@ -373,6 +373,112 @@ def fetch_questions_by_tournament_url(tournament_url: str, max_pages: int = 25, 
             subjects.append(s)
     return subjects
 
+
+def _collect_questions_from_query(params: Dict[str, Any], cap: int = 2000) -> List[Dict[str, Any]]:
+    """Generic paginator over /api2/questions/ with given params; returns normalized subject dicts."""
+    url = f"{API2}/questions/"
+    out, seen = [], set()
+    next_url = url
+    local = dict({"limit": 200}, **params)
+    while next_url and len(out) < cap:
+        data = _get(HTTP_QS, next_url, local if next_url == url else None, UA_QS)
+        results = data.get("results") or data.get("data") or []
+        for q in results:
+            qid = q.get("id")
+            if not qid or qid in seen: 
+                continue
+            seen.add(qid)
+            out.append({
+                "id": qid,
+                "title": q.get("title", ""),
+                "url": q.get("page_url") or q.get("url") or f"{BASE}/questions/{qid}/",
+                "body": q.get("description") or q.get("body") or q.get("background") or q.get("text") or "",
+            })
+        next_url = data.get("next")
+        if not next_url: 
+            break
+    return out
+
+def extract_tournament_slug(t: str) -> str:
+    s = (t or '').strip().strip('/')
+    if not s: return ''
+    m = re.search(r'/tournament/([^/?#]+)/?', s)
+    if m: return m.group(1).strip('/')
+    if s.startswith('tournament/'): return s.split('/',1)[1].strip('/')
+    return s.split('/')[-1]
+
+def fetch_questions_by_tournament_api_first(tournament_text: str, debug: bool = False) -> List[Dict[str, Any]]:
+    """Resolve a tournament (URL or slug) to questions using API first; fallback to HTML scrape."""
+    slug = extract_tournament_slug(tournament_text)
+    if not slug:
+        return []
+    strategies = []
+
+    # Try param variants that may accept slug directly
+    slug_params = [
+        {"tournament": slug}, {"tournament__slug": slug},
+        {"competition": slug}, {"competition__slug": slug},
+        {"group": slug}, {"group__slug": slug},
+        {"collection": slug}, {"collection__slug": slug},
+        {"collections": slug}, {"collections__slug": slug},
+    ]
+    for p in slug_params:
+        try:
+            res = _collect_questions_from_query(p)
+            if debug: st.write("API slug-param attempt", p, "->", len(res), "questions")
+            if res: return res
+        except Exception as e:
+            if debug: st.write("API slug-param failed", p, e)
+
+    # Resolve an object by slug, then query with numeric id
+    endpoints = [
+        (f"{API2}/tournaments/{slug}/", "tournament"),
+        (f"{API2}/competitions/{slug}/", "competition"),
+        (f"{API2}/groups/{slug}/", "group"),
+        (f"{API2}/collections/{slug}/", "collection"),
+    ]
+    for url, key in endpoints:
+        try:
+            obj = _get(HTTP_QS, url, None, UA_QS)
+            tid = obj.get("id") or obj.get("pk")
+            if tid:
+                res = _collect_questions_from_query({key: tid})
+                if debug: st.write("API object-id attempt", url, "->", len(res), "questions")
+                if res: return res
+        except Exception as e:
+            if debug: st.write("API object-id failed", url, e)
+
+    # Try dedicated questions listing endpoints if they exist (some Metaculus objects expose nested routes)
+    nested = [
+        f"{API2}/tournaments/{slug}/questions/",
+        f"{API2}/competitions/{slug}/questions/",
+        f"{API2}/groups/{slug}/questions/",
+        f"{API2}/collections/{slug}/questions/",
+    ]
+    for url in nested:
+        try:
+            data = _get(HTTP_QS, url, {"limit":200}, UA_QS)
+            results = data.get("results") or data.get("data") or []
+            subs = []
+            for q in results:
+                qid = q.get("id")
+                if not qid: continue
+                subs.append({
+                    "id": qid,
+                    "title": q.get("title",""),
+                    "url": q.get("page_url") or q.get("url") or f"{BASE}/questions/{qid}/",
+                    "body": q.get("description") or q.get("body") or q.get("background") or q.get("text") or "",
+                })
+            if debug: st.write("API nested route attempt", url, "->", len(subs), "questions")
+            if subs: return subs
+        except Exception as e:
+            if debug: st.write("API nested route failed", url, e)
+
+    # Last fallback: HTML scrape (React pages may not list links)
+    subjects = fetch_questions_by_tournament_url(tournament_text, max_pages=30, sleep_s=0.2)
+    if debug: st.write("HTML scrape fallback ->", len(subjects), "questions")
+    return subjects
+
 # ================================
 # Comment Scorer (module A)
 
@@ -513,7 +619,7 @@ def run_comment_scorer():
     with colA:
         mode = st.radio("Mode", ["Score recent questions", "Score specific IDs", "By commenter ID", "By tournament URL/slug"], horizontal=True)
     with colB:
-        if st.button("🔁 Press here for a new run", key="newrun_score_top"):
+        if st.button("🔁 Appuyer ici pour un nouveau run", key="newrun_score_top"):
             start_new_run()
 
     model_choice = _resolve_model_from_sidebar("DEFAULT")
@@ -698,6 +804,7 @@ st.title("🔮 Metaculus Suite — Comments • Question Generation • Factors"
 
 with st.sidebar:
     st.header("🔐 API & Models")
+    DEBUG = st.checkbox('Debug mode (verbose)', value=False)
     st.caption("Enter your OpenRouter key here. It overrides env/secrets for this session.")
     api_key_input = st.text_input("OpenRouter API key", type="password", key="OPENROUTER_API_KEY_SIDEBAR")
     if api_key_input:
