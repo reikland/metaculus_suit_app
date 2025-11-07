@@ -223,8 +223,12 @@ def parse_json_relaxed(s: str, expect: str = "auto") -> Any:
     raise ValueError("Could not parse JSON from model output")
 
 def start_new_run():
-    for k in list(st.session_state.keys()):
-        del st.session_state[k]
+    for k in [
+        'score_df','score_agg_q','score_agg_author',
+        'OPENROUTER_API_KEY_OVERRIDE'
+    ]:
+        if k in st.session_state:
+            del st.session_state[k]
     list_models_clean.clear()
     st.rerun()
 
@@ -594,6 +598,7 @@ def run_comment_scorer():
                         rows.append(
                             {
                                 "poster_id": a.get("id"),
+                                "poster_username": (a.get("username") or a.get("name") or ""),
                                 "comment_id": c.get("id"),
                                 "market_id": s["id"],
                                 "ai_score": score,
@@ -611,12 +616,11 @@ def run_comment_scorer():
             st.error(f"Error: {e}")
             rows = []
 
+        # Persist results in session_state to avoid disappearing on rerun (e.g., after a download)
         if rows:
             df = pd.DataFrame(rows)
-            st.success(f"{len(rows)} comments scored across {df['market_id'].nunique()} question(s).")
-            st.dataframe(df, use_container_width=True, height=400)
-
-            agg = (
+            # Aggregations
+            agg_q = (
                 df.groupby(["market_id","question_title","question_url"])
                   .agg(n_comments=("ai_score","size"),
                        avg_score=("ai_score","mean"),
@@ -624,17 +628,48 @@ def run_comment_scorer():
                        p_high=("ai_score", lambda x: (x>=4).mean()))
                   .reset_index()
             )
-            st.markdown("#### Aggregated (by question)")
-            st.dataframe(agg, use_container_width=True)
+            agg_author = (
+                df.groupby(["poster_id","poster_username"])
+                  .agg(n_comments=("ai_score","size"),
+                       avg_score=("ai_score","mean"),
+                       p_low=("ai_score", lambda x: (x<=2).mean()),
+                       p_high=("ai_score", lambda x: (x>=4).mean()))
+                  .reset_index()
+            )
+            st.session_state["score_df"] = df
+            st.session_state["score_agg_q"] = agg_q
+            st.session_state["score_agg_author"] = agg_author
+
+        # Render any existing results from session_state (so downloads never nuke the view)
+        if "score_df" in st.session_state and isinstance(st.session_state["score_df"], pd.DataFrame):
+            df = st.session_state["score_df"]
+            agg_q = st.session_state.get("score_agg_q", pd.DataFrame())
+            agg_author = st.session_state.get("score_agg_author", pd.DataFrame())
+
+            st.success(f"{len(df)} comments scored across {df['market_id'].nunique()} question(s).")
+            st.dataframe(df, use_container_width=True, height=400)
+
+            st.markdown("#### Aggregated — by question")
+            if isinstance(agg_q, pd.DataFrame) and not agg_q.empty:
+                st.dataframe(agg_q, use_container_width=True)
+            else:
+                st.info("No question-level aggregation available yet.")
+
+            st.markdown("#### Aggregated — by commenter")
+            if isinstance(agg_author, pd.DataFrame) and not agg_author.empty:
+                st.dataframe(agg_author, use_container_width=True)
+            else:
+                st.info("No commenter-level aggregation available yet.")
 
             def to_csv_bytes(frame: pd.DataFrame) -> bytes:
                 buf = io.StringIO()
                 frame.to_csv(buf, index=False)
                 return buf.getvalue().encode("utf-8")
 
-            c1, c2 = st.columns(2)
-            c1.download_button("💾 Download raw comment scores CSV", data=to_csv_bytes(df), file_name="metaculus_comment_scores_raw.csv", mime="text/csv")
-            c2.download_button("💾 Download aggregated scores CSV", data=to_csv_bytes(agg), file_name="metaculus_comment_scores_aggregated.csv", mime="text/csv")
+            c1, c2, c3 = st.columns(3)
+            c1.download_button("💾 Download RAW CSV", data=to_csv_bytes(df), file_name="metaculus_comment_scores_raw.csv", mime="text/csv")
+            c2.download_button("💾 Download by QUESTION CSV", data=to_csv_bytes(agg_q), file_name="metaculus_comment_scores_by_question.csv", mime="text/csv")
+            c3.download_button("💾 Download by COMMENTER CSV", data=to_csv_bytes(agg_author), file_name="metaculus_comment_scores_by_commenter.csv", mime="text/csv")
 
             st.markdown("---")
             st.button("🔁 Appuyer ici pour un nouveau run", key="newrun_score_bottom", on_click=start_new_run)
