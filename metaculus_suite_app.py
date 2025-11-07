@@ -1,3 +1,9 @@
+# Write a fresh complete version of the unified app implementing:
+# - Sidebar API & model controls
+# - Comment Scorer: two downloads without reset + "Nouveau run" button
+# - Question Generator: two downloads without reset + "Nouveau run" button
+# - Question Factors: CSV download + "Nouveau run" button
+# Save to /mnt/data/metaculus_suite_app.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -28,8 +34,8 @@ API2 = "https://www.metaculus.com/api2"
 API = "https://www.metaculus.com/api"
 
 UA_QS   = {"User-Agent": "metaculus-question-factors/1.0 (+python-requests)"}
-UA_COM  = {"User-Agent": "metaculus-comments-llm-scorer/0.8 (+python-requests)"}
-UA_QGEN = {"User-Agent": "metaculus-ai-qgen/1.2 (+python-requests)"}
+UA_COM  = {"User-Agent": "metaculus-comments-llm-scorer/0.9 (+python-requests)"}
+UA_QGEN = {"User-Agent": "metaculus-ai-qgen/1.3 (+python-requests)"}
 
 HTTP_QS = requests.Session()
 HTTP_COM = requests.Session()
@@ -371,7 +377,7 @@ def score_with_llm(qtitle: str, qurl: str, c: Dict[str, Any], model: str) -> Dic
     key = hashlib.sha256(text.encode("utf-8")).hexdigest()
     if key not in _cache_score:
         msgs = build_msgs_score(qtitle, qurl, text, c.get("id"), (c.get("author") or {}).get("id"), c.get("vote_score"))
-        resp = call_openrouter(msgs, model, max_tokens=220, temperature=0.0, expect="object", title_hint="Metaculus Comment Scorer", ua_hint="metaculus-comments-llm-scorer/0.8")
+        resp = call_openrouter(msgs, model, max_tokens=220, temperature=0.0, expect="object", title_hint="Metaculus Comment Scorer", ua_hint="metaculus-comments-llm-scorer/0.9")
         _cache_score[key] = resp
     return _cache_score[key]
 
@@ -382,7 +388,8 @@ def run_comment_scorer():
     with colA:
         mode = st.radio("Mode", ["Score recent questions", "Score specific IDs"], horizontal=True)
     with colB:
-        if st.button("🧹 Start a new run"):
+        # Keep a manual new-run button separate from downloads
+        if st.button("🔁 Appuyer ici pour un nouveau run", key="newrun_score_top"):
             start_new_run()
 
     # Use sidebar default model (or its custom override)
@@ -468,7 +475,7 @@ def run_comment_scorer():
             st.markdown("#### Aggregated (by question)")
             st.dataframe(agg, use_container_width=True)
 
-            # Downloads
+            # Downloads (no rerun side effects)
             def to_csv_bytes(frame: pd.DataFrame) -> bytes:
                 buf = io.StringIO()
                 frame.to_csv(buf, index=False)
@@ -477,6 +484,9 @@ def run_comment_scorer():
             c1, c2 = st.columns(2)
             c1.download_button("💾 Download raw comment scores CSV", data=to_csv_bytes(df), file_name="metaculus_comment_scores_raw.csv", mime="text/csv")
             c2.download_button("💾 Download aggregated scores CSV", data=to_csv_bytes(agg), file_name="metaculus_comment_scores_aggregated.csv", mime="text/csv")
+
+            st.markdown("---")
+            st.button("🔁 Appuyer ici pour un nouveau run", key="newrun_score_bottom", on_click=start_new_run)
         else:
             st.info("No comments were scored.")
 
@@ -612,7 +622,7 @@ def run_question_factors():
     with colA:
         mode = st.radio("Input mode", ["Recent questions", "Specific IDs"], horizontal=True)
     with colB:
-        if st.button("🧹 Start a new run"):
+        if st.button("🔁 Appuyer ici pour un nouveau run", key="newrun_factors_top"):
             start_new_run()
 
     # Use sidebar default model
@@ -651,6 +661,9 @@ def run_question_factors():
                     st.dataframe(df, use_container_width=True)
                     buf = io.StringIO(); df.to_csv(buf, index=False)
                     st.download_button("💾 Download CSV", data=buf.getvalue().encode("utf-8"), file_name="metaculus_question_factors.csv", mime="text/csv")
+
+                    st.markdown("---")
+                    st.button("🔁 Appuyer ici pour un nouveau run", key="newrun_factors_bottom", on_click=start_new_run)
                 else:
                     st.info("No factors returned.")
         except Exception as e:
@@ -780,7 +793,7 @@ def generate_candidates(brief: str, tags: List[str], horizon: str, n: int, good:
     user = GEN_USER_TMPL.format(n=n, brief=brief, tags=",".join(tags), horizon=horizon, good_examples=good_str, bad_examples=bad_str)
     resp = call_openrouter(
         [{"role":"system","content":GEN_SYS},{"role":"user","content":user}],
-        model=model, max_tokens=4000, temperature=0.5, expect="array", title_hint="Metaculus AI Question Generation", ua_hint="metaculus-ai-qgen/1.2"
+        model=model, max_tokens=4000, temperature=0.5, expect="array", title_hint="Metaculus AI Question Generation", ua_hint="metaculus-ai-qgen/1.3"
     )
     if isinstance(resp, list): return resp
     if isinstance(resp, dict) and "candidates" in resp and isinstance(resp["candidates"], list): return resp["candidates"]
@@ -791,7 +804,7 @@ def critique_and_revise(cand: Dict[str, Any], model: str, dry_run: bool = False)
     if dry_run:
         return cand, {"clarity":4,"falsifiability":4,"operationalization":4,"usefulness":4,"safety":5}
     user = CRIT_USER_TMPL.format(candidate_json=json.dumps(cand, ensure_ascii=False))
-    resp = call_openrouter([{"role":"system","content":CRIT_SYS},{"role":"user","content":user}], model=model, max_tokens=2000, temperature=0.1, expect="object", title_hint="Metaculus AI QGEN Critique", ua_hint="metaculus-ai-qgen/1.2")
+    resp = call_openrouter([{"role":"system","content":CRIT_SYS},{"role":"user","content":user}], model=model, max_tokens=2000, temperature=0.1, expect="object", title_hint="Metaculus AI QGEN Critique", ua_hint="metaculus-ai-qgen/1.3")
     revised = resp.get("revised_candidate") or cand
     scores = {k.lower(): int(round(float(v))) for k, v in (resp.get("scores") or {}).items()}
     return revised, scores
@@ -801,7 +814,7 @@ def judge(cand: Dict[str, Any], model: str, dry_run: bool = False) -> Dict[str, 
         base = 3.6 + random.random()*1.0
         return {"scores":{"clarity":4,"falsifiability":4,"operationalization":4,"usefulness":4,"safety":5},"overall":round(min(5.0, base),2),"blockers":[],"notes":"mock"}
     user = JUDGE_USER_TMPL.format(candidate_json=json.dumps(cand, ensure_ascii=False))
-    resp = call_openrouter([{"role":"system","content":JUDGE_SYS},{"role":"user","content":user}], model=model, max_tokens=1200, temperature=0.0, expect="object", title_hint="Metaculus AI QGEN Judge", ua_hint="metaculus-ai-qgen/1.2")
+    resp = call_openrouter([{"role":"system","content":JUDGE_SYS},{"role":"user","content":user}], model=model, max_tokens=1200, temperature=0.0, expect="object", title_hint="Metaculus AI QGEN Judge", ua_hint="metaculus-ai-qgen/1.3")
     resp["overall"] = float(resp.get("overall", 0.0))
     return resp
 
@@ -809,7 +822,7 @@ def pairwise_battle(A: Dict[str, Any], B: Dict[str, Any], model: str, dry_run: b
     if dry_run:
         return "A" if random.random()<0.5 else "B"
     user = PAIRWISE_USER_TMPL.format(A=json.dumps(A, ensure_ascii=False), B=json.dumps(B, ensure_ascii=False))
-    resp = call_openrouter([{"role":"system","content":PAIRWISE_SYS},{"role":"user","content":user}], model=model, max_tokens=400, temperature=0.0, expect="object", title_hint="Metaculus AI QGEN Pairwise", ua_hint="metaculus-ai-qgen/1.2")
+    resp = call_openrouter([{"role":"system","content":PAIRWISE_SYS},{"role":"user","content":user}], model=model, max_tokens=400, temperature=0.0, expect="object", title_hint="Metaculus AI QGEN Pairwise", ua_hint="metaculus-ai-qgen/1.3")
     return resp.get("winner","A")
 
 def run_pipeline_in_memory(brief: str, tags: List[str], horizon: str, n: int = 10, examples_csv: Optional[str] = None, top_k: int = 5, dry_run: bool = False, models: Dict[str,str] = None) -> Dict[str, Any]:
@@ -863,6 +876,10 @@ def run_question_generator():
     ex_col1, ex_col2 = st.columns(2)
     scrape_n = ex_col1.slider("Scrape N Metaculus examples (0 = none)", min_value=0, max_value=50, value=0, step=5)
     examples_file = ex_col2.file_uploader("Or upload Metaculus example questions CSV", type=["csv"])
+
+    top_newrun = st.button("🔁 Appuyer ici pour un nouveau run", key="newrun_qgen_top", help="Réinitialiser l'app et recommencer.")
+    if top_newrun:
+        start_new_run()
 
     if st.button("▶️ Generate & rank", type="primary"):
         if not brief.strip():
@@ -955,7 +972,7 @@ def run_question_generator():
                 if top_row.get("judge_notes"):
                     st.markdown(f"**Judge notes:** {top_row['judge_notes']}")
 
-                # Downloads
+                # Downloads (no reset)
                 csv_buf = io.StringIO(); df.to_csv(csv_buf, index=False)
                 csv_bytes = csv_buf.getvalue().encode("utf-8")
 
@@ -968,6 +985,9 @@ def run_question_generator():
                 c1, c2 = st.columns(2)
                 c1.download_button("💾 Download CSV", data=csv_bytes, file_name="metaculus_ai_qgen_top.csv", mime="text/csv")
                 c2.download_button("💾 Download JSONL", data=jsonl_bytes, file_name="metaculus_ai_qgen_top.jsonl", mime="application/json")
+
+                st.markdown("---")
+                st.button("🔁 Appuyer ici pour un nouveau run", key="newrun_qgen_bottom", on_click=start_new_run)
             else:
                 st.info("No candidates generated.")
 
@@ -1038,4 +1058,11 @@ elif mode == "Question Generator":
     run_question_generator()
 else:
     run_question_factors()
-st.caption("Tip:add OPENROUTER_API_KEY in app secrets (Settings → Secrets) or enter it here. This app calls Metaculus public APIs and OpenRouter.")
+
+st.caption("Tip: add OPENROUTER_API_KEY in app secrets (Settings → Secrets) or enter it here. This app calls Metaculus public APIs and OpenRouter.")'''
+
+with open("/mnt/data/metaculus_suite_app.py", "w", encoding="utf-8") as f:
+    f.write(app_code)
+
+"/mnt/data/metaculus_suite_app.py"
+
