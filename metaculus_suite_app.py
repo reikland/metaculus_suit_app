@@ -371,6 +371,93 @@ def fetch_questions_by_tournament_url(tournament_url: str, max_pages: int = 25, 
 
 # ================================
 # Comment Scorer (module A)
+
+def extract_tournament_slug(t: str) -> str:
+    """Return slug like 'colombia-wage-watch' from URL or input."""
+    s = (t or "").strip().strip("/")
+    if not s:
+        return ""
+    # full URL -> keep path
+    m = re.search(r"/tournament/([^/?#]+)/?", s)
+    if m:
+        return m.group(1).strip("/")
+    # already looks like 'tournament/slug'
+    if s.startswith("tournament/"):
+        return s.split("/", 1)[1].strip("/")
+    # assume it's just the slug
+    return s.split("/")[-1]
+
+def _api2_get(url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return _get(HTTP_QS, url, params or {}, UA_QS)
+
+def _collect_questions_from_query(params: Dict[str, Any], cap: int = 1000) -> List[Dict[str, Any]]:
+    url = f"{API2}/questions/"
+    out = []
+    next_url = url
+    local_params = dict(params)
+    seen_ids = set()
+    # paginate via "next"
+    while next_url and len(out) < cap:
+        data = _get(HTTP_QS, next_url, local_params if next_url == url else None, UA_QS)
+        results = data.get("results") or data.get("data") or []
+        for q in results:
+            qid = q.get("id")
+            if not qid or qid in seen_ids:
+                continue
+            seen_ids.add(qid)
+            out.append({
+                "id": qid,
+                "title": q.get("title", ""),
+                "url": q.get("page_url") or q.get("url") or f"{BASE}/questions/{qid}/",
+                "body": q.get("description") or q.get("body") or q.get("background") or q.get("text") or "",
+            })
+        next_url = data.get("next")
+        if not next_url:
+            break
+    return out
+
+def fetch_questions_by_tournament_slug(slug: str) -> List[Dict[str, Any]]:
+    """Robust resolver: try endpoints to grab numeric IDs, then query questions."""
+    slug = (slug or "").strip()
+    if not slug:
+        return []
+
+    # First try direct param with slug (some endpoints accept string keys)
+    for k in ("tournament","competition","group","collection","collections"):
+        try:
+            res = _collect_questions_from_query({k: slug, "limit": 200})
+            if res:
+                return res
+        except Exception:
+            pass
+
+    # Then try resolving to IDs via various API2 endpoints
+    endpoints = [
+        (f"{API2}/tournaments/{slug}/", "tournament"),
+        (f"{API2}/competitions/{slug}/", "competition"),
+        (f"{API2}/groups/{slug}/", "group"),
+        (f"{API2}/collections/{slug}/", "collection"),
+    ]
+    candidate_params = []
+    for url, key in endpoints:
+        try:
+            obj = _api2_get(url, None)
+            # accept either 'id' or 'pk'
+            tid = obj.get("id") or obj.get("pk")
+            if tid:
+                candidate_params.append({key: tid, "limit": 200})
+        except Exception:
+            continue
+
+    for params in candidate_params:
+        try:
+            res = _collect_questions_from_query(params)
+            if res:
+                return res
+        except Exception:
+            continue
+
+    return []
 # ================================
 
 SYSTEM_PROMPT_SCORE = (
@@ -475,6 +562,9 @@ def run_comment_scorer():
                     if s: subjects.append(s)
             elif mode == "By tournament URL/slug":
                 subjects = fetch_questions_by_tournament_url(tournament_text, max_pages=30, sleep_s=0.2)
+                if not subjects:
+                    slug = extract_tournament_slug(tournament_text)
+                    subjects = fetch_questions_by_tournament_slug(slug)
             else:
                 subjects = []
 
