@@ -24,16 +24,19 @@ import streamlit as st
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS = "https://openrouter.ai/api/v1/models"
 
-API2 = "https://www.metaculus.com/api2"
-API = "https://www.metaculus.com/api"
+BASE = "https://www.metaculus.com"
+API2 = f"{BASE}/api2"
+API = f"{BASE}/api"
 
 UA_QS   = {"User-Agent": "metaculus-question-factors/1.0 (+python-requests)"}
-UA_COM  = {"User-Agent": "metaculus-comments-llm-scorer/1.0 (+python-requests)"}
+UA_COM  = {"User-Agent": "metaculus-comments-llm-scorer/1.1 (+python-requests)"}
 UA_QGEN = {"User-Agent": "metaculus-ai-qgen/1.3 (+python-requests)"}
+UA_SCRAPE = {"User-Agent": "metaculus-tournament-scraper/1.0 (+python-requests)"}
 
 HTTP_QS = requests.Session()
 HTTP_COM = requests.Session()
 HTTP_QGEN = requests.Session()
+HTTP_SCRAPE = requests.Session()
 
 PREFERRED_MODELS = [
     "openai/gpt-4o-mini",
@@ -252,7 +255,7 @@ def fetch_recent_questions(n_subjects: int = 10, page_limit: int = 80) -> List[D
             {
                 "id": qid,
                 "title": q.get("title", ""),
-                "url": q.get("page_url") or q.get("url") or f"https://www.metaculus.com/questions/{qid}/",
+                "url": q.get("page_url") or q.get("url") or f"{BASE}/questions/{qid}/",
                 "body": q.get("description") or q.get("body") or q.get("background") or q.get("text") or "",
             }
         )
@@ -265,7 +268,7 @@ def fetch_question_by_id(qid: int) -> Optional[Dict[str, Any]]:
         return {
             "id": q["id"],
             "title": q.get("title", f"Question {qid}"),
-            "url": q.get("page_url") or q.get("url") or f"https://www.metaculus.com/questions/{qid}/",
+            "url": q.get("page_url") or q.get("url") or f"{BASE}/questions/{qid}/",
             "body": q.get("description") or q.get("body") or q.get("background") or q.get("text") or "",
         }
     except Exception:
@@ -292,39 +295,6 @@ def fetch_comments_for_post(post_id: int, page_limit: int = 120) -> List[Dict[st
                 break
     return out
 
-def fetch_questions_by_tournament(tournament_id: int, limit: int = 200) -> List[Dict[str, Any]]:
-    params_variants = [
-        {"limit": limit, "tournament": tournament_id},
-        {"limit": limit, "competition": tournament_id},
-        {"limit": limit, "group": tournament_id},
-        {"limit": limit, "collection": tournament_id},
-    ]
-    tried = set()
-    for pv in params_variants:
-        key = tuple(sorted(pv.items()))
-        if key in tried:
-            continue
-        tried.add(key)
-        try:
-            data = _get(HTTP_QS, f"{API2}/questions/", pv, UA_QS)
-            results = data.get("results") or data.get("data") or []
-            out = []
-            for q in results:
-                qid = q.get("id")
-                if not qid:
-                    continue
-                out.append({
-                    "id": qid,
-                    "title": q.get("title", ""),
-                    "url": q.get("page_url") or q.get("url") or f"https://www.metaculus.com/questions/{qid}/",
-                    "body": q.get("description") or q.get("body") or q.get("background") or q.get("text") or "",
-                })
-            if out:
-                return out
-        except Exception:
-            continue
-    return []
-
 def fetch_comments_by_author(author_id: int, page_limit: int = 200) -> List[Dict[str, Any]]:
     base = f"{API}/comments/"
     params = {"author": author_id, "limit": page_limit, "offset": 0, "sort": "-created_at", "is_private": "false"}
@@ -345,6 +315,59 @@ def fetch_comments_by_author(author_id: int, page_limit: int = 200) -> List[Dict
             else:
                 break
     return out
+
+# -------- Tournament scraping (URL or slug) --------
+
+def normalize_tournament_url(user_text: str) -> str:
+    t = (user_text or "").strip()
+    if not t:
+        return ""
+    if t.startswith("http://") or t.startswith("https://"):
+        url = t
+    elif t.startswith("/"):
+        url = f"{BASE}{t}"
+    elif t.startswith("tournament/"):
+        url = f"{BASE}/{t.strip('/')}/"
+    else:
+        # assume it's a slug
+        url = f"{BASE}/tournament/{t.strip('/')}/"
+    if not url.endswith("/"):
+        url += "/"
+    return url
+
+def extract_question_ids_from_html(html: str) -> List[int]:
+    # Grab any /questions/<id>/ occurrences
+    ids = set(int(x) for x in re.findall(r"/questions/(\d+)/", html))
+    return sorted(ids)
+
+def fetch_questions_by_tournament_url(tournament_url: str, max_pages: int = 25, sleep_s: float = 0.25) -> List[Dict[str, Any]]:
+    url = normalize_tournament_url(tournament_url)
+    if not url:
+        return []
+    all_ids = set()
+    # Try paginated pages (?page=2...) until no new IDs
+    for page in range(1, max_pages + 1):
+        page_url = url if page == 1 else f"{url}?page={page}"
+        try:
+            r = HTTP_SCRAPE.get(page_url, headers=UA_SCRAPE, timeout=20)
+            if r.status_code != 200:
+                break
+            ids = extract_question_ids_from_html(r.text)
+            before = len(all_ids)
+            all_ids.update(ids)
+            if len(all_ids) == before:
+                # No new questions found on this page -> stop
+                break
+            time.sleep(sleep_s)
+        except Exception:
+            break
+    # Resolve IDs into subject dicts
+    subjects = []
+    for qid in sorted(all_ids):
+        s = fetch_question_by_id(qid)
+        if s:
+            subjects.append(s)
+    return subjects
 
 # ================================
 # Comment Scorer (module A)
@@ -388,7 +411,7 @@ def score_with_llm(qtitle: str, qurl: str, c: Dict[str, Any], model: str) -> Dic
     key = hashlib.sha256(text.encode("utf-8")).hexdigest()
     if key not in _cache_score:
         msgs = build_msgs_score(qtitle, qurl, text, c.get("id"), (c.get("author") or {}).get("id"), c.get("vote_score"))
-        resp = call_openrouter(msgs, model, max_tokens=220, temperature=0.0, expect="object", title_hint="Metaculus Comment Scorer", ua_hint="metaculus-comments-llm-scorer/1.0")
+        resp = call_openrouter(msgs, model, max_tokens=220, temperature=0.0, expect="object", title_hint="Metaculus Comment Scorer", ua_hint="metaculus-comments-llm-scorer/1.1")
         _cache_score[key] = resp
     return _cache_score[key]
 
@@ -397,7 +420,7 @@ def run_comment_scorer():
     st.caption("Fetch Metaculus comments and rate quality with an LLM. Exports raw and aggregated CSVs.")
     colA, colB = st.columns([2,1])
     with colA:
-        mode = st.radio("Mode", ["Score recent questions", "Score specific IDs", "By commenter ID", "By tournament ID"], horizontal=True)
+        mode = st.radio("Mode", ["Score recent questions", "Score specific IDs", "By commenter ID", "By tournament URL/slug"], horizontal=True)
     with colB:
         if st.button("🔁 Appuyer ici pour un nouveau run", key="newrun_score_top"):
             start_new_run()
@@ -405,11 +428,10 @@ def run_comment_scorer():
     model_choice = _resolve_model_from_sidebar("DEFAULT")
     comments_limit = st.number_input("Max comments per question", min_value=10, max_value=500, value=120, step=10)
 
-    # Inputs per mode
     qids: List[int] = []
     commenter_id = None
     only_author = True
-    tournament_id = None
+    tournament_text = ""
 
     if mode == "Score recent questions":
         n = st.number_input("Number of recent questions", min_value=1, max_value=100, value=10, step=1)
@@ -424,15 +446,14 @@ def run_comment_scorer():
     elif mode == "By commenter ID":
         commenter_id = st.number_input("Commenter (author) ID", min_value=1, step=1, value=1)
         only_author = st.checkbox("Score only this author's comments (ignore others)", value=True)
-    elif mode == "By tournament ID":
-        tournament_id = st.number_input("Tournament ID", min_value=1, step=1, value=1)
-        st.caption("Tip: tournament IDs can also be called 'competition' or 'group'; we try multiple API parameters.")
+    elif mode == "By tournament URL/slug":
+        tournament_text = st.text_input("Tournament URL or slug", value="https://www.metaculus.com/tournament/colombia-wage-watch/",
+                                        help="Exemples: full URL, 'tournament/colombia-wage-watch/', or just 'colombia-wage-watch'")
 
     if st.button("▶️ Run scoring", type="primary"):
         rows: List[Dict[str, Any]] = []
         try:
             model = model_choice
-            # Build subjects list (questions to iterate)
             if mode == "Score recent questions":
                 subjects = fetch_recent_questions(n_subjects=int(n), page_limit=80)
             elif mode == "Score specific IDs":
@@ -452,8 +473,8 @@ def run_comment_scorer():
                 for pid in post_ids:
                     s = fetch_question_by_id(pid)
                     if s: subjects.append(s)
-            elif mode == "By tournament ID":
-                subjects = fetch_questions_by_tournament(int(tournament_id), limit=200)
+            elif mode == "By tournament URL/slug":
+                subjects = fetch_questions_by_tournament_url(tournament_text, max_pages=30, sleep_s=0.2)
             else:
                 subjects = []
 
@@ -467,13 +488,12 @@ def run_comment_scorer():
                     status.info(f"Processing {i}/{total}: [{s['id']}] {s['title']}")
                     comments = fetch_comments_for_post(s["id"], page_limit=int(comments_limit))
                     for c in comments:
-                        # Filter to author's comments when requested
                         if mode == "By commenter ID" and only_author:
                             a_id = (c.get("author") or {}).get("id")
                             if int(a_id or -1) != int(commenter_id):
                                 continue
                         text = " ".join((c.get("text") or "").split())
-                        if not text: 
+                        if not text:
                             continue
                         a = c.get("author") or {}
                         resp = score_with_llm(s["title"], s["url"], c, model)
@@ -532,11 +552,9 @@ def run_comment_scorer():
             st.info("No comments were scored.")
 
 # ================================
-# Question Factors (module B)
-# (unchanged from previous version, omitted for brevity in this snippet)
+# Stubs for the other modules (unchanged in this patch)
 # ================================
 
-# To keep this file self-contained for the exercise, we provide minimal stubs for the other modules.
 def run_question_factors():
     st.subheader("📈 Question Factors (LLM)")
     st.info("This section is unchanged in this patch.")
