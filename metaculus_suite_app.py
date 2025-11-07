@@ -340,7 +340,6 @@ def normalize_tournament_url(user_text: str) -> str:
     return url
 
 def extract_question_ids_from_html(html: str) -> List[int]:
-    # Grab any /questions/<id>/ occurrences
     ids = set(int(x) for x in re.findall(r"/questions/(\d+)/", html))
     return sorted(ids)
 
@@ -360,7 +359,6 @@ def fetch_questions_by_tournament_url(tournament_url: str, max_pages: int = 25, 
             before = len(all_ids)
             all_ids.update(ids)
             if len(all_ids) == before:
-                # No new questions found on this page -> stop
                 break
             time.sleep(sleep_s)
         except Exception:
@@ -373,7 +371,6 @@ def fetch_questions_by_tournament_url(tournament_url: str, max_pages: int = 25, 
             subjects.append(s)
     return subjects
 
-
 def _collect_questions_from_query(params: Dict[str, Any], cap: int = 2000) -> List[Dict[str, Any]]:
     """Generic paginator over /api2/questions/ with given params; returns normalized subject dicts."""
     url = f"{API2}/questions/"
@@ -385,7 +382,7 @@ def _collect_questions_from_query(params: Dict[str, Any], cap: int = 2000) -> Li
         results = data.get("results") or data.get("data") or []
         for q in results:
             qid = q.get("id")
-            if not qid or qid in seen: 
+            if not qid or qid in seen:
                 continue
             seen.add(qid)
             out.append({
@@ -395,7 +392,7 @@ def _collect_questions_from_query(params: Dict[str, Any], cap: int = 2000) -> Li
                 "body": q.get("description") or q.get("body") or q.get("background") or q.get("text") or "",
             })
         next_url = data.get("next")
-        if not next_url: 
+        if not next_url:
             break
     return out
 
@@ -412,8 +409,6 @@ def fetch_questions_by_tournament_api_first(tournament_text: str, debug: bool = 
     slug = extract_tournament_slug(tournament_text)
     if not slug:
         return []
-    strategies = []
-
     # Try param variants that may accept slug directly
     slug_params = [
         {"tournament": slug}, {"tournament__slug": slug},
@@ -429,8 +424,7 @@ def fetch_questions_by_tournament_api_first(tournament_text: str, debug: bool = 
             if res: return res
         except Exception as e:
             if debug: st.write("API slug-param failed", p, e)
-
-    # Resolve an object by slug, then query with numeric id
+    # Resolve object by slug -> id -> query
     endpoints = [
         (f"{API2}/tournaments/{slug}/", "tournament"),
         (f"{API2}/competitions/{slug}/", "competition"),
@@ -447,92 +441,17 @@ def fetch_questions_by_tournament_api_first(tournament_text: str, debug: bool = 
                 if res: return res
         except Exception as e:
             if debug: st.write("API object-id failed", url, e)
-
-    # Try dedicated questions listing endpoints if they exist (some Metaculus objects expose nested routes)
-    nested = [
-        f"{API2}/tournaments/{slug}/questions/",
-        f"{API2}/competitions/{slug}/questions/",
-        f"{API2}/groups/{slug}/questions/",
-        f"{API2}/collections/{slug}/questions/",
-    ]
-    for url in nested:
-        try:
-            data = _get(HTTP_QS, url, {"limit":200}, UA_QS)
-            results = data.get("results") or data.get("data") or []
-            subs = []
-            for q in results:
-                qid = q.get("id")
-                if not qid: continue
-                subs.append({
-                    "id": qid,
-                    "title": q.get("title",""),
-                    "url": q.get("page_url") or q.get("url") or f"{BASE}/questions/{qid}/",
-                    "body": q.get("description") or q.get("body") or q.get("background") or q.get("text") or "",
-                })
-            if debug: st.write("API nested route attempt", url, "->", len(subs), "questions")
-            if subs: return subs
-        except Exception as e:
-            if debug: st.write("API nested route failed", url, e)
-
-    # Last fallback: HTML scrape (React pages may not list links)
+    # Fallback: HTML scrape
     subjects = fetch_questions_by_tournament_url(tournament_text, max_pages=30, sleep_s=0.2)
     if debug: st.write("HTML scrape fallback ->", len(subjects), "questions")
     return subjects
 
-# ================================
-# Comment Scorer (module A)
-
-def extract_tournament_slug(t: str) -> str:
-    """Return slug like 'colombia-wage-watch' from URL or input."""
-    s = (t or "").strip().strip("/")
-    if not s:
-        return ""
-    # full URL -> keep path
-    m = re.search(r"/tournament/([^/?#]+)/?", s)
-    if m:
-        return m.group(1).strip("/")
-    # already looks like 'tournament/slug'
-    if s.startswith("tournament/"):
-        return s.split("/", 1)[1].strip("/")
-    # assume it's just the slug
-    return s.split("/")[-1]
-
-def _api2_get(url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    return _get(HTTP_QS, url, params or {}, UA_QS)
-
-def _collect_questions_from_query(params: Dict[str, Any], cap: int = 1000) -> List[Dict[str, Any]]:
-    url = f"{API2}/questions/"
-    out = []
-    next_url = url
-    local_params = dict(params)
-    seen_ids = set()
-    # paginate via "next"
-    while next_url and len(out) < cap:
-        data = _get(HTTP_QS, next_url, local_params if next_url == url else None, UA_QS)
-        results = data.get("results") or data.get("data") or []
-        for q in results:
-            qid = q.get("id")
-            if not qid or qid in seen_ids:
-                continue
-            seen_ids.add(qid)
-            out.append({
-                "id": qid,
-                "title": q.get("title", ""),
-                "url": q.get("page_url") or q.get("url") or f"{BASE}/questions/{qid}/",
-                "body": q.get("description") or q.get("body") or q.get("background") or q.get("text") or "",
-            })
-        next_url = data.get("next")
-        if not next_url:
-            break
-    return out
-
 def fetch_questions_by_tournament_slug(slug: str) -> List[Dict[str, Any]]:
-    """Robust resolver: try endpoints to grab numeric IDs, then query questions."""
+    """Robust resolver: try multiple endpoints to grab numeric IDs, then query questions."""
     slug = (slug or "").strip()
     if not slug:
         return []
-
-    # First try direct param with slug (some endpoints accept string keys)
+    # Direct param with slug
     for k in ("tournament","competition","group","collection","collections"):
         try:
             res = _collect_questions_from_query({k: slug, "limit": 200})
@@ -540,8 +459,7 @@ def fetch_questions_by_tournament_slug(slug: str) -> List[Dict[str, Any]]:
                 return res
         except Exception:
             pass
-
-    # Then try resolving to IDs via various API2 endpoints
+    # Resolve to IDs via various API2 endpoints
     endpoints = [
         (f"{API2}/tournaments/{slug}/", "tournament"),
         (f"{API2}/competitions/{slug}/", "competition"),
@@ -551,14 +469,12 @@ def fetch_questions_by_tournament_slug(slug: str) -> List[Dict[str, Any]]:
     candidate_params = []
     for url, key in endpoints:
         try:
-            obj = _api2_get(url, None)
-            # accept either 'id' or 'pk'
+            obj = _get(HTTP_QS, url, None, UA_QS)
             tid = obj.get("id") or obj.get("pk")
             if tid:
                 candidate_params.append({key: tid, "limit": 200})
         except Exception:
             continue
-
     for params in candidate_params:
         try:
             res = _collect_questions_from_query(params)
@@ -566,8 +482,10 @@ def fetch_questions_by_tournament_slug(slug: str) -> List[Dict[str, Any]]:
                 return res
         except Exception:
             continue
-
     return []
+
+# ================================
+# Comment Scorer (module A)
 # ================================
 
 SYSTEM_PROMPT_SCORE = (
@@ -612,6 +530,57 @@ def score_with_llm(qtitle: str, qurl: str, c: Dict[str, Any], model: str) -> Dic
         _cache_score[key] = resp
     return _cache_score[key]
 
+# ================================
+# Downloads fragment (prevents full rerun on download)
+# ================================
+
+def _downloads_ui(df: pd.DataFrame, agg_q: pd.DataFrame, agg_author: pd.DataFrame):
+    st.success(f"{len(df)} comments scored across {df['market_id'].nunique()} question(s).")
+    st.dataframe(df, use_container_width=True, height=400)
+
+    st.markdown("#### Aggregated — by question")
+    if isinstance(agg_q, pd.DataFrame) and not agg_q.empty:
+        st.dataframe(agg_q, use_container_width=True)
+    else:
+        st.info("No question-level aggregation available yet.")
+
+    st.markdown("#### Aggregated — by commenter")
+    if isinstance(agg_author, pd.DataFrame) and not agg_author.empty:
+        st.dataframe(agg_author, use_container_width=True)
+    else:
+        st.info("No commenter-level aggregation available yet.")
+
+    def to_csv_bytes(frame: pd.DataFrame) -> bytes:
+        buf = io.StringIO()
+        frame.to_csv(buf, index=False)
+        return buf.getvalue().encode("utf-8")
+
+    c1, c2, c3 = st.columns(3)
+    c1.download_button("💾 Download RAW CSV", data=to_csv_bytes(df),
+                       file_name="metaculus_comment_scores_raw.csv", mime="text/csv", key="dl_raw_csv")
+    c2.download_button("💾 Download by QUESTION CSV", data=to_csv_bytes(agg_q),
+                       file_name="metaculus_comment_scores_by_question.csv", mime="text/csv", key="dl_by_q_csv")
+    c3.download_button("💾 Download by COMMENTER CSV", data=to_csv_bytes(agg_author),
+                       file_name="metaculus_comment_scores_by_commenter.csv", mime="text/csv", key="dl_by_author_csv")
+
+    st.markdown("---")
+    st.button("🔁 Appuyer ici pour un nouveau run", key="newrun_score_bottom", on_click=start_new_run)
+
+# Prefer fragment if available (partial reruns only)
+if hasattr(st, "fragment"):
+    @st.fragment
+    def downloads_fragment(df: pd.DataFrame, agg_q: pd.DataFrame, agg_author: pd.DataFrame):
+        _downloads_ui(df, agg_q, agg_author)
+else:
+    # Fallback: normal function; whole script technically reruns on click,
+    # but we keep everything in session_state so nothing recalculates or disparaît.
+    def downloads_fragment(df: pd.DataFrame, agg_q: pd.DataFrame, agg_author: pd.DataFrame):
+        _downloads_ui(df, agg_q, agg_author)
+
+# ================================
+# Comment Scorer UI/logic
+# ================================
+
 def run_comment_scorer():
     st.subheader("🔍 Comment Scorer")
     st.caption("Fetch Metaculus comments and rate quality with an LLM. Exports raw and aggregated CSVs.")
@@ -625,34 +594,42 @@ def run_comment_scorer():
     model_choice = _resolve_model_from_sidebar("DEFAULT")
     comments_limit = st.number_input("Max comments per question", min_value=10, max_value=500, value=120, step=10)
 
-    qids: List[int] = []
-    commenter_id = None
-    only_author = True
-    tournament_text = ""
+    # Inputs inside a form: nothing runs until submit is pressed.
+    with st.form("scorer_form", clear_on_submit=False):
+        qids: List[int] = []
+        commenter_id = None
+        only_author = True
+        tournament_text = ""
 
-    if mode == "Score recent questions":
-        n = st.number_input("Number of recent questions", min_value=1, max_value=100, value=10, step=1)
-    elif mode == "Score specific IDs":
-        qids_str = st.text_area("Metaculus Question IDs (comma or space separated)", placeholder="Example: 12345, 67890, 13579")
-        if qids_str.strip():
-            for chunk in qids_str.replace(",", " ").split():
-                try:
-                    qids.append(int(chunk))
-                except ValueError:
-                    pass
-    elif mode == "By commenter ID":
-        commenter_id = st.number_input("Commenter (author) ID", min_value=1, step=1, value=1)
-        only_author = st.checkbox("Score only this author's comments (ignore others)", value=True)
-    elif mode == "By tournament URL/slug":
-        tournament_text = st.text_input("Tournament URL or slug", value="https://www.metaculus.com/tournament/colombia-wage-watch/",
-                                        help="Exemples: full URL, 'tournament/colombia-wage-watch/', or just 'colombia-wage-watch'")
+        if mode == "Score recent questions":
+            n = st.number_input("Number of recent questions", min_value=1, max_value=100, value=10, step=1, key="recent_n")
+        elif mode == "Score specific IDs":
+            qids_str = st.text_area("Metaculus Question IDs (comma or space separated)",
+                                    placeholder="Example: 12345, 67890, 13579", key="ids_str")
+            if qids_str.strip():
+                for chunk in qids_str.replace(",", " ").split():
+                    try:
+                        qids.append(int(chunk))
+                    except ValueError:
+                        pass
+        elif mode == "By commenter ID":
+            commenter_id = st.number_input("Commenter (author) ID", min_value=1, step=1, value=1)
+            only_author = st.checkbox("Score only this author's comments (ignore others)", value=True)
+        elif mode == "By tournament URL/slug":
+            tournament_text = st.text_input(
+                "Tournament URL or slug",
+                value="https://www.metaculus.com/tournament/colombia-wage-watch/",
+                help="Exemples: full URL, 'tournament/colombia-wage-watch/', or just 'colombia-wage-watch'"
+            )
 
-    if st.button("▶️ Run scoring", type="primary"):
+        submitted = st.form_submit_button("▶️ Run scoring", type="primary")
+
+    if submitted:
         rows: List[Dict[str, Any]] = []
         try:
             model = model_choice
             if mode == "Score recent questions":
-                subjects = fetch_recent_questions(n_subjects=int(n), page_limit=80)
+                subjects = fetch_recent_questions(n_subjects=int(st.session_state.get("recent_n", 10)), page_limit=80)
             elif mode == "Score specific IDs":
                 subjects = []
                 for q in qids:
@@ -722,10 +699,8 @@ def run_comment_scorer():
             st.error(f"Error: {e}")
             rows = []
 
-        # Persist results in session_state to avoid disappearing on rerun (e.g., after a download)
         if rows:
             df = pd.DataFrame(rows)
-            # Aggregations
             agg_q = (
                 df.groupby(["market_id","question_title","question_url"])
                   .agg(n_comments=("ai_score","size"),
@@ -742,45 +717,20 @@ def run_comment_scorer():
                        p_high=("ai_score", lambda x: (x>=4).mean()))
                   .reset_index()
             )
+            # Persist so ANY rerun (e.g., a download click) shows the same data without recompute
             st.session_state["score_df"] = df
             st.session_state["score_agg_q"] = agg_q
             st.session_state["score_agg_author"] = agg_author
 
-        # Render any existing results from session_state (so downloads never nuke the view)
-        if "score_df" in st.session_state and isinstance(st.session_state["score_df"], pd.DataFrame):
-            df = st.session_state["score_df"]
-            agg_q = st.session_state.get("score_agg_q", pd.DataFrame())
-            agg_author = st.session_state.get("score_agg_author", pd.DataFrame())
-
-            st.success(f"{len(df)} comments scored across {df['market_id'].nunique()} question(s).")
-            st.dataframe(df, use_container_width=True, height=400)
-
-            st.markdown("#### Aggregated — by question")
-            if isinstance(agg_q, pd.DataFrame) and not agg_q.empty:
-                st.dataframe(agg_q, use_container_width=True)
-            else:
-                st.info("No question-level aggregation available yet.")
-
-            st.markdown("#### Aggregated — by commenter")
-            if isinstance(agg_author, pd.DataFrame) and not agg_author.empty:
-                st.dataframe(agg_author, use_container_width=True)
-            else:
-                st.info("No commenter-level aggregation available yet.")
-
-            def to_csv_bytes(frame: pd.DataFrame) -> bytes:
-                buf = io.StringIO()
-                frame.to_csv(buf, index=False)
-                return buf.getvalue().encode("utf-8")
-
-            c1, c2, c3 = st.columns(3)
-            c1.download_button("💾 Download RAW CSV", data=to_csv_bytes(df), file_name="metaculus_comment_scores_raw.csv", mime="text/csv")
-            c2.download_button("💾 Download by QUESTION CSV", data=to_csv_bytes(agg_q), file_name="metaculus_comment_scores_by_question.csv", mime="text/csv")
-            c3.download_button("💾 Download by COMMENTER CSV", data=to_csv_bytes(agg_author), file_name="metaculus_comment_scores_by_commenter.csv", mime="text/csv")
-
-            st.markdown("---")
-            st.button("🔁 Appuyer ici pour un nouveau run", key="newrun_score_bottom", on_click=start_new_run)
-        else:
-            st.info("No comments were scored.")
+    # Always render existing results without recomputing
+    if "score_df" in st.session_state and isinstance(st.session_state["score_df"], pd.DataFrame):
+        df = st.session_state["score_df"]
+        agg_q = st.session_state.get("score_agg_q", pd.DataFrame())
+        agg_author = st.session_state.get("score_agg_author", pd.DataFrame())
+        # This reruns ONLY the fragment when available; otherwise it’s a no-op that keeps state.
+        downloads_fragment(df, agg_q, agg_author)
+    else:
+        st.info("No comments were scored.")
 
 # ================================
 # Stubs for the other modules (unchanged in this patch)
@@ -862,3 +812,4 @@ else:
     run_question_factors()
 
 st.caption("Tip: add OPENROUTER_API_KEY in app secrets (Settings → Secrets) or enter it here.")
+
