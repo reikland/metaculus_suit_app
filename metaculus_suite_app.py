@@ -418,6 +418,46 @@ def fetch_questions_by_tournament_api_first(tournament_text: str, debug: bool = 
     for p in slug_params:
         try:
             res = _collect_questions_from_query(p)
+            if res:
+                return res
+        except Exception:
+            pass
+    # Resolve to IDs via various API2 endpoints
+    endpoints = [
+        (f"{API2}/tournaments/{slug}/", "tournament"),
+        (f"{API2}/competitions/{slug}/", "competition"),
+        (f"{API2}/groups/{slug}/", "group"),
+        (f"{API2}/collections/{slug}/", "collection"),
+    ]
+    candidate_params = []
+    for url, key in endpoints:
+        try:
+            obj = _get(HTTP_QS, url, None, UA_QS)
+            tid = obj.get("id") or obj.get("pk")
+            if tid:
+                candidate_params.append({key: tid, "limit": 200})
+        except Exception:
+            continue
+    for params in candidate_params:
+        try:
+            res = _collect_questions_from_query(params)
+            if res:
+                return res
+        except Exception:
+            continue
+    # FINAL FALLBACK: HTML scrape of the /questions/ subpage
+    return fetch_questions_by_tournament_url(tournament_text)
+    # Try param variants that may accept slug directly
+    slug_params = [
+        {"tournament": slug}, {"tournament__slug": slug},
+        {"competition": slug}, {"competition__slug": slug},
+        {"group": slug}, {"group__slug": slug},
+        {"collection": slug}, {"collection__slug": slug},
+        {"collections": slug}, {"collections__slug": slug},
+    ]
+    for p in slug_params:
+        try:
+            res = _collect_questions_from_query(p)
             if debug: st.write("API slug-param attempt", p, "->", len(res), "questions")
             if res: return res
         except Exception as e:
@@ -810,4 +850,5 @@ else:
     run_question_factors()
 
 st.caption("Tip: add OPENROUTER_API_KEY in app secrets (Settings → Secrets) or enter it here.")
+
 
