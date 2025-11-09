@@ -337,31 +337,62 @@ def normalize_tournament_url(user_text: str) -> str:
         url += "/"
     return url
 
+
 def extract_question_ids_from_html(html: str) -> List[int]:
-    ids = set(int(x) for x in re.findall(r"/questions/(\d+)/", html))
+    ids = set()
+    # a) classic hrefs
+    for x in re.findall(r"/questions/(\d+)/", html):
+        try:
+            ids.add(int(x))
+        except Exception:
+            pass
+    # b) raw JSON hydration like: question":{"id":39716,"title":"..."}
+    for x in re.findall(r'question"\s*:\s*\{\s*"id"\s*:\s*(\d+)', html, flags=re.I):
+        try:
+            ids.add(int(x))
+        except Exception:
+            pass
+    # c) HTML-escaped JSON like: question&quot;:{&quot;id&quot;:39716,...}
+    for x in re.findall(r'question&quot;\s*:\s*\{\s*&quot;id&quot;\s*:\s*(\d+)', html, flags=re.I):
+        try:
+            ids.add(int(x))
+        except Exception:
+            pass
+    # d) Generic pattern: any /questions/<id>/ reference inside JSON blobs
+    for x in re.findall(r'/questions/(\d+)/[^"\']*', html):
+        try:
+            ids.add(int(x))
+        except Exception:
+            pass
     return sorted(ids)
+
 
 def fetch_questions_by_tournament_url(tournament_url: str, max_pages: int = 25, sleep_s: float = 0.25) -> List[Dict[str, Any]]:
     url = normalize_tournament_url(tournament_url)
     if not url:
         return []
+    # We'll try both the root (in case it contains embedded JSON) and the dedicated /questions/ page
+    base_urls = [url]
+    if not re.search(r"/questions/?$", url):
+        base_urls.append(url.rstrip("/") + "/questions/")
+
     all_ids = set()
-    # Try paginated pages (?page=2...) until no new IDs
-    for page in range(1, max_pages + 1):
-        page_url = url if page == 1 else f"{url}?page={page}"
-        try:
-            r = HTTP_SCRAPE.get(page_url, headers=UA_SCRAPE, timeout=20)
-            if r.status_code != 200:
+    for base in base_urls:
+        for page in range(1, max_pages + 1):
+            page_url = base if page == 1 else f"{base}?page={page}"
+            try:
+                r = HTTP_SCRAPE.get(page_url, headers=UA_SCRAPE, timeout=20)
+                if r.status_code != 200:
+                    break
+                ids = extract_question_ids_from_html(r.text)
+                before = len(all_ids)
+                all_ids.update(ids)
+                if len(all_ids) == before:
+                    break
+                time.sleep(sleep_s)
+            except Exception:
                 break
-            ids = extract_question_ids_from_html(r.text)
-            before = len(all_ids)
-            all_ids.update(ids)
-            if len(all_ids) == before:
-                break
-            time.sleep(sleep_s)
-        except Exception:
-            break
-    # Resolve IDs into subject dicts
+
     subjects = []
     for qid in sorted(all_ids):
         s = fetch_question_by_id(qid)
@@ -407,46 +438,6 @@ def fetch_questions_by_tournament_api_first(tournament_text: str, debug: bool = 
     slug = extract_tournament_slug(tournament_text)
     if not slug:
         return []
-    # Try param variants that may accept slug directly
-    slug_params = [
-        {"tournament": slug}, {"tournament__slug": slug},
-        {"competition": slug}, {"competition__slug": slug},
-        {"group": slug}, {"group__slug": slug},
-        {"collection": slug}, {"collection__slug": slug},
-        {"collections": slug}, {"collections__slug": slug},
-    ]
-    for p in slug_params:
-        try:
-            res = _collect_questions_from_query(p)
-            if res:
-                return res
-        except Exception:
-            pass
-    # Resolve to IDs via various API2 endpoints
-    endpoints = [
-        (f"{API2}/tournaments/{slug}/", "tournament"),
-        (f"{API2}/competitions/{slug}/", "competition"),
-        (f"{API2}/groups/{slug}/", "group"),
-        (f"{API2}/collections/{slug}/", "collection"),
-    ]
-    candidate_params = []
-    for url, key in endpoints:
-        try:
-            obj = _get(HTTP_QS, url, None, UA_QS)
-            tid = obj.get("id") or obj.get("pk")
-            if tid:
-                candidate_params.append({key: tid, "limit": 200})
-        except Exception:
-            continue
-    for params in candidate_params:
-        try:
-            res = _collect_questions_from_query(params)
-            if res:
-                return res
-        except Exception:
-            continue
-    # FINAL FALLBACK: HTML scrape of the /questions/ subpage
-    return fetch_questions_by_tournament_url(tournament_text)
     # Try param variants that may accept slug directly
     slug_params = [
         {"tournament": slug}, {"tournament__slug": slug},
@@ -690,6 +681,27 @@ def run_comment_scorer():
                 if not subjects:
                     slug = extract_tournament_slug(tournament_text)
                     subjects = fetch_questions_by_tournament_slug(slug)
+
+                # -- CSV export of found tournament questions + helper to pre-fill "Score specific IDs" --
+                try:
+                    if subjects:
+                        df_ids = pd.DataFrame([{
+                            "question_id": s.get("id"),
+                            "title": (s.get("title") or s.get("name") or ""),
+                            "url": f"{BASE}/questions/{s.get('id')}/"
+                        } for s in subjects])
+                        with st.expander("Tournament questions found", expanded=False):
+                            st.dataframe(df_ids, use_container_width=True, height=260)
+                            st.download_button("⬇️ Download tournament questions (CSV)",
+                                               data=df_ids.to_csv(index=False).encode("utf-8"),
+                                               file_name="tournament_questions.csv",
+                                               mime="text/csv",
+                                               key="dl_tourn_ids_csv")
+                            if st.button("➡️ Send these IDs to 'Score specific IDs'"):
+                                st.session_state["ids_str"] = " ".join(str(x) for x in df_ids["question_id"].tolist())
+                                st.success("IDs copied to the 'Score specific IDs' input.")
+                except Exception as _e:
+                    st.warning(f"Could not build CSV for IDs: {_e}")
             else:
                 subjects = []
 
@@ -850,5 +862,6 @@ else:
     run_question_factors()
 
 st.caption("Tip: add OPENROUTER_API_KEY in app secrets (Settings → Secrets) or enter it here.")
+
 
 
