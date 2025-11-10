@@ -606,7 +606,7 @@ def _downloads_ui(df: pd.DataFrame, agg_q: pd.DataFrame, agg_author: pd.DataFram
                        file_name="metaculus_comment_scores_by_commenter.csv", mime="text/csv", key="dl_by_author_csv")
 
     st.markdown("---")
-    st.button("🔁 Appuyer ici pour un nouveau run", key="newrun_score_bottom", on_click=start_new_run)
+    st.button("🔁 Press here for a new run", key="newrun_score_bottom", on_click=start_new_run)
 
 # Prefer fragment if available (partial reruns only)
 if hasattr(st, "fragment"):
