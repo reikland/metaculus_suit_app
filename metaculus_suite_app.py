@@ -1,4 +1,3 @@
-
 import os
 import io
 import re
@@ -366,6 +365,20 @@ def extract_question_ids_from_html(html: str) -> List[int]:
             pass
     return sorted(ids)
 
+# --- Utilities for tournament 'View Source' file ------------------------------
+POST_ID_PATTERN = re.compile(
+    r'\{\\"id\\":(\d+),\\"title\\":\\"(.*?)\\",\\"question\\":\{',
+    re.DOTALL
+)
+
+def extract_tournament_post_ids(html: str) -> List[int]:
+    try:
+        ids = [int(m.group(1)) for m in POST_ID_PATTERN.finditer(html or "")]
+        return sorted(set(ids))
+    except Exception:
+        return []
+# -----------------------------------------------------------------------------
+
 
 def fetch_questions_by_tournament_url(tournament_url: str, max_pages: int = 25, sleep_s: float = 0.25) -> List[Dict[str, Any]]:
     url = normalize_tournament_url(tournament_url)
@@ -615,7 +628,7 @@ def run_comment_scorer():
     st.caption("Fetch Metaculus comments and rate quality with an LLM. Exports raw and aggregated CSVs.")
     colA, colB = st.columns([2,1])
     with colA:
-        mode = st.radio("Mode", ["Score recent questions", "Score specific IDs", "By commenter ID", "By tournament URL/slug"], horizontal=True)
+        mode = st.radio("Mode", ["Score recent questions", "Score specific IDs", "By commenter ID", "By tournament URL/slug", "Tournament ID Retrieve (file)"], horizontal=True)
     with colB:
         if st.button("🔁 Appuyer ici pour un nouveau run", key="newrun_score_top"):
             start_new_run()
@@ -651,6 +664,15 @@ def run_comment_scorer():
                 help="Exemples: full URL, 'tournament/colombia-wage-watch/', or just 'colombia-wage-watch'"
             )
 
+        
+        elif mode == "Tournament ID Retrieve (file)":
+            uploaded_file = st.file_uploader(
+                "Upload tournament page source (HTML/TXT)",
+                type=["html", "htm", "txt"],
+                accept_multiple_files=False,
+                key="tournament_file_uploader",
+                help="Open the tournament page → View Page Source → Save as .html, then upload it here."
+            )
         submitted = st.form_submit_button("▶️ Run scoring", type="primary")
 
     if submitted:
@@ -659,6 +681,50 @@ def run_comment_scorer():
             model = model_choice
             if mode == "Score recent questions":
                 subjects = fetch_recent_questions(n_subjects=int(st.session_state.get("recent_n", 10)), page_limit=80)
+            elif mode == "Tournament ID Retrieve (file)":
+                subjects = []
+                html_data = ""
+                if 'uploaded_file' in locals() and uploaded_file is not None:
+                    try:
+                        html_data = uploaded_file.read().decode("utf-8", "ignore")
+                    except Exception:
+                        html_data = ""
+                if not html_data:
+                    st.warning("Please upload a tournament page source file (HTML/TXT).")
+                else:
+                    post_ids = extract_tournament_post_ids(html_data)
+                    if not post_ids:
+                        fallback_ids = extract_question_ids_from_html(html_data)
+                        if fallback_ids:
+                            st.info(f"Fallback used: found {len(fallback_ids)} question IDs via /questions/ references.")
+                            post_ids = fallback_ids
+                    if not post_ids:
+                        st.warning("No IDs found in the uploaded file.")
+                    else:
+                        for qid in post_ids:
+                            s = fetch_question_by_id(qid)
+                            if s:
+                                subjects.append(s)
+                        try:
+                            if subjects:
+                                df_ids = pd.DataFrame([{
+                                    "question_id": s.get("id"),
+                                    "title": (s.get("title") or s.get("name") or ""),
+                                    "url": f"{BASE}/questions/{s.get('id')}/"
+                                } for s in subjects])
+                                with st.expander("Tournament questions found (from file)", expanded=False):
+                                    st.dataframe(df_ids, use_container_width=True, height=260)
+                                    st.download_button("⬇️ Download tournament questions (CSV)",
+                                                       data=df_ids.to_csv(index=False).encode("utf-8"),
+                                                       file_name="tournament_questions_from_file.csv",
+                                                       mime="text/csv",
+                                                       key="dl_tourn_file_ids_csv")
+                                    if st.button("➡️ Send these IDs to 'Score specific IDs' (from file)"):
+                                        st.session_state["ids_str"] = " ".join(str(x) for x in df_ids["question_id"].tolist())
+                                        st.success("IDs copied to the 'Score specific IDs' input.")
+                        except Exception as _e:
+                            st.warning(f"Could not build CSV for IDs (file mode): {_e}")
+
             elif mode == "Score specific IDs":
                 subjects = []
                 for q in qids:
@@ -862,6 +928,8 @@ else:
     run_question_factors()
 
 st.caption("Tip: add OPENROUTER_API_KEY in app secrets (Settings → Secrets) or enter it here.")
+
+
 
 
 
