@@ -1,3 +1,7 @@
+# metaculus_suite_app.py — unified, with Tournament (by ID) flow
+# Keeps UI aesthetics; removes old tournament & commenter modes; adds robust Tournament-ID→CSV→score.
+# Token Metaculus hardcoded per user request.
+
 import os
 import io
 import re
@@ -5,9 +9,6 @@ import csv
 import time
 import json
 import hashlib
-import itertools
-import random
-import tempfile
 from typing import Dict, Any, List, Optional, Tuple
 
 import requests
@@ -25,10 +26,25 @@ BASE = "https://www.metaculus.com"
 API2 = f"{BASE}/api2"
 API = f"{BASE}/api"
 
-UA_QS   = {"User-Agent": "metaculus-question-factors/1.0 (+python-requests)"}
-UA_COM  = {"User-Agent": "metaculus-comments-llm-scorer/1.1 (+python-requests)"}
-UA_QGEN = {"User-Agent": "metaculus-ai-qgen/1.3 (+python-requests)"}
-UA_SCRAPE = {"User-Agent": "metaculus-tournament-scraper/1.0 (+python-requests)"}
+# ---- Metaculus token (hardcoded as requested) ----
+METACULUS_TOKEN = "a5217e06384668c082997ec2d5b0c68945497b43".strip()
+
+UA_QS = {
+    "User-Agent": "metaculus-question-factors/1.0 (+python-requests)",
+    "Authorization": f"Token {METACULUS_TOKEN}",
+}
+UA_COM = {
+    "User-Agent": "metaculus-comments-llm-scorer/1.1 (+python-requests)",
+    "Authorization": f"Token {METACULUS_TOKEN}",
+}
+UA_QGEN = {
+    "User-Agent": "metaculus-ai-qgen/1.3 (+python-requests)",
+    "Authorization": f"Token {METACULUS_TOKEN}",
+}
+UA_SCRAPE = {
+    "User-Agent": "metaculus-tournament-scraper/1.0 (+python-requests)",
+    "Authorization": f"Token {METACULUS_TOKEN}",
+}
 
 HTTP_QS = requests.Session()
 HTTP_COM = requests.Session()
@@ -146,7 +162,7 @@ def _resolve_model_from_sidebar(base_key: str, fallback: Optional[str] = None) -
         return dd.strip()
     return pick_model(fallback)
 
-def call_openrouter(messages: List[Dict[str, str]], model: str, max_tokens: int = 1200, temperature: float = 0.0, retries: int = 3, expect: str = "auto", title_hint: str = "Metaculus Suite", ua_hint: str = "metaculus-suite/1.0") -> Any:
+def call_openrouter(messages: List[Dict[str, str]], model: str, max_tokens: int = 220, temperature: float = 0.0, retries: int = 3, expect: str = "object", title_hint: str = "Metaculus Comment Scorer", ua_hint: str = "metaculus-comments-llm-scorer/1.1") -> Any:
     payload = {"model": model, "messages": messages, "temperature": temperature, "top_p": 1, "max_tokens": max_tokens}
     last = None
     for k in range(retries):
@@ -296,122 +312,7 @@ def fetch_comments_for_post(post_id: int, page_limit: int = 120) -> List[Dict[st
                 break
     return out
 
-def fetch_comments_by_author(author_id: int, page_limit: int = 200) -> List[Dict[str, Any]]:
-    base = f"{API}/comments/"
-    params = {"author": author_id, "limit": page_limit, "offset": 0, "sort": "-created_at", "is_private": "false"}
-    out, url = [], base
-    while url:
-        data = _get(HTTP_COM, url, params if url == base else None, UA_COM)
-        batch = data.get("results") or []
-        out += batch
-        nxt = data.get("next")
-        if nxt:
-            url = nxt
-            time.sleep(0.2)
-        else:
-            if batch and len(out) < 2000:
-                params["offset"] = params.get("offset", 0) + params.get("limit", page_limit)
-                url = base
-                time.sleep(0.2)
-            else:
-                break
-    return out
-
-# -------- Tournament scraping (URL or slug) --------
-
-def normalize_tournament_url(user_text: str) -> str:
-    t = (user_text or "").strip()
-    if not t:
-        return ""
-    if t.startswith("http://") or t.startswith("https://"):
-        url = t
-    elif t.startswith("/"):
-        url = f"{BASE}{t}"
-    elif t.startswith("tournament/"):
-        url = f"{BASE}/{t.strip('/')}/"
-    else:
-        # assume it's a slug
-        url = f"{BASE}/tournament/{t.strip('/')}/"
-    if not url.endswith("/"):
-        url += "/"
-    return url
-
-
-def extract_question_ids_from_html(html: str) -> List[int]:
-    ids = set()
-    # a) classic hrefs
-    for x in re.findall(r"/questions/(\d+)/", html):
-        try:
-            ids.add(int(x))
-        except Exception:
-            pass
-    # b) raw JSON hydration like: question":{"id":39716,"title":"..."}
-    for x in re.findall(r'question"\s*:\s*\{\s*"id"\s*:\s*(\d+)', html, flags=re.I):
-        try:
-            ids.add(int(x))
-        except Exception:
-            pass
-    # c) HTML-escaped JSON like: question&quot;:{&quot;id&quot;:39716,...}
-    for x in re.findall(r'question&quot;\s*:\s*\{\s*&quot;id&quot;\s*:\s*(\d+)', html, flags=re.I):
-        try:
-            ids.add(int(x))
-        except Exception:
-            pass
-    # d) Generic pattern: any /questions/<id>/ reference inside JSON blobs
-    for x in re.findall(r'/questions/(\d+)/[^"\']*', html):
-        try:
-            ids.add(int(x))
-        except Exception:
-            pass
-    return sorted(ids)
-
-# --- Utilities for tournament 'View Source' file ------------------------------
-POST_ID_PATTERN = re.compile(
-    r'\{\\"id\\":(\d+),\\"title\\":\\"(.*?)\\",\\"question\\":\{',
-    re.DOTALL
-)
-
-def extract_tournament_post_ids(html: str) -> List[int]:
-    try:
-        ids = [int(m.group(1)) for m in POST_ID_PATTERN.finditer(html or "")]
-        return sorted(set(ids))
-    except Exception:
-        return []
-# -----------------------------------------------------------------------------
-
-
-def fetch_questions_by_tournament_url(tournament_url: str, max_pages: int = 25, sleep_s: float = 0.25) -> List[Dict[str, Any]]:
-    url = normalize_tournament_url(tournament_url)
-    if not url:
-        return []
-    # We'll try both the root (in case it contains embedded JSON) and the dedicated /questions/ page
-    base_urls = [url]
-    if not re.search(r"/questions/?$", url):
-        base_urls.append(url.rstrip("/") + "/questions/")
-
-    all_ids = set()
-    for base in base_urls:
-        for page in range(1, max_pages + 1):
-            page_url = base if page == 1 else f"{base}?page={page}"
-            try:
-                r = HTTP_SCRAPE.get(page_url, headers=UA_SCRAPE, timeout=20)
-                if r.status_code != 200:
-                    break
-                ids = extract_question_ids_from_html(r.text)
-                before = len(all_ids)
-                all_ids.update(ids)
-                if len(all_ids) == before:
-                    break
-                time.sleep(sleep_s)
-            except Exception:
-                break
-
-    subjects = []
-    for qid in sorted(all_ids):
-        s = fetch_question_by_id(qid)
-        if s:
-            subjects.append(s)
-    return subjects
+# -------- Tournament (by numeric ID) --------
 
 def _collect_questions_from_query(params: Dict[str, Any], cap: int = 2000) -> List[Dict[str, Any]]:
     """Generic paginator over /api2/questions/ with given params; returns normalized subject dicts."""
@@ -438,88 +339,42 @@ def _collect_questions_from_query(params: Dict[str, Any], cap: int = 2000) -> Li
             break
     return out
 
-def extract_tournament_slug(t: str) -> str:
-    s = (t or '').strip().strip('/')
-    if not s: return ''
-    m = re.search(r'/tournament/([^/?#]+)/?', s)
-    if m: return m.group(1).strip('/')
-    if s.startswith('tournament/'): return s.split('/',1)[1].strip('/')
-    return s.split('/')[-1]
-
-def fetch_questions_by_tournament_api_first(tournament_text: str, debug: bool = False) -> List[Dict[str, Any]]:
-    """Resolve a tournament (URL or slug) to questions using API first; fallback to HTML scrape."""
-    slug = extract_tournament_slug(tournament_text)
-    if not slug:
+def fetch_questions_by_tournament_id(tid: int, debug: bool = False) -> List[Dict[str, Any]]:
+    """
+    Robust resolver for *numeric* tournament-like IDs.
+    Tries multiple param names: tournament / competition / group / collection / collections.
+    """
+    if not tid or tid <= 0:
         return []
-    # Try param variants that may accept slug directly
-    slug_params = [
-        {"tournament": slug}, {"tournament__slug": slug},
-        {"competition": slug}, {"competition__slug": slug},
-        {"group": slug}, {"group__slug": slug},
-        {"collection": slug}, {"collection__slug": slug},
-        {"collections": slug}, {"collections__slug": slug},
+    candidates = [
+        {"tournament": tid},
+        {"competition": tid},
+        {"group": tid},
+        {"collection": tid},
+        {"collections": tid},
     ]
-    for p in slug_params:
+    for p in candidates:
         try:
             res = _collect_questions_from_query(p)
-            if debug: st.write("API slug-param attempt", p, "->", len(res), "questions")
-            if res: return res
-        except Exception as e:
-            if debug: st.write("API slug-param failed", p, e)
-    # Resolve object by slug -> id -> query
-    endpoints = [
-        (f"{API2}/tournaments/{slug}/", "tournament"),
-        (f"{API2}/competitions/{slug}/", "competition"),
-        (f"{API2}/groups/{slug}/", "group"),
-        (f"{API2}/collections/{slug}/", "collection"),
-    ]
-    for url, key in endpoints:
-        try:
-            obj = _get(HTTP_QS, url, None, UA_QS)
-            tid = obj.get("id") or obj.get("pk")
-            if tid:
-                res = _collect_questions_from_query({key: tid})
-                if debug: st.write("API object-id attempt", url, "->", len(res), "questions")
-                if res: return res
-        except Exception as e:
-            if debug: st.write("API object-id failed", url, e)
-    # Fallback: HTML scrape
-    subjects = fetch_questions_by_tournament_url(tournament_text, max_pages=30, sleep_s=0.2)
-    if debug: st.write("HTML scrape fallback ->", len(subjects), "questions")
-    return subjects
-
-def fetch_questions_by_tournament_slug(slug: str) -> List[Dict[str, Any]]:
-    """Robust resolver: try multiple endpoints to grab numeric IDs, then query questions."""
-    slug = (slug or "").strip()
-    if not slug:
-        return []
-    # Direct param with slug
-    for k in ("tournament","competition","group","collection","collections"):
-        try:
-            res = _collect_questions_from_query({k: slug, "limit": 200})
+            if debug:
+                st.write("API attempt", p, "->", len(res), "questions")
             if res:
                 return res
-        except Exception:
-            pass
-    # Resolve to IDs via various API2 endpoints
+        except Exception as e:
+            if debug:
+                st.write("API failed", p, e)
+    # As a final fallback try to resolve object endpoints then query by its id
     endpoints = [
-        (f"{API2}/tournaments/{slug}/", "tournament"),
-        (f"{API2}/competitions/{slug}/", "competition"),
-        (f"{API2}/groups/{slug}/", "group"),
-        (f"{API2}/collections/{slug}/", "collection"),
+        (f"{API2}/tournaments/{tid}/", "tournament"),
+        (f"{API2}/competitions/{tid}/", "competition"),
+        (f"{API2}/groups/{tid}/", "group"),
+        (f"{API2}/collections/{tid}/", "collection"),
     ]
-    candidate_params = []
     for url, key in endpoints:
         try:
             obj = _get(HTTP_QS, url, None, UA_QS)
-            tid = obj.get("id") or obj.get("pk")
-            if tid:
-                candidate_params.append({key: tid, "limit": 200})
-        except Exception:
-            continue
-    for params in candidate_params:
-        try:
-            res = _collect_questions_from_query(params)
+            real_id = obj.get("id") or obj.get("pk") or tid
+            res = _collect_questions_from_query({key: real_id})
             if res:
                 return res
         except Exception:
@@ -608,14 +463,12 @@ def _downloads_ui(df: pd.DataFrame, agg_q: pd.DataFrame, agg_author: pd.DataFram
     st.markdown("---")
     st.button("🔁 Press here for a new run", key="newrun_score_bottom", on_click=start_new_run)
 
-# Prefer fragment if available (partial reruns only)
+# Prefer fragment if available
 if hasattr(st, "fragment"):
     @st.fragment
     def downloads_fragment(df: pd.DataFrame, agg_q: pd.DataFrame, agg_author: pd.DataFrame):
         _downloads_ui(df, agg_q, agg_author)
 else:
-    # Fallback: normal function; whole script technically reruns on click,
-    # but we keep everything in session_state so nothing recalculates or disparaît.
     def downloads_fragment(df: pd.DataFrame, agg_q: pd.DataFrame, agg_author: pd.DataFrame):
         _downloads_ui(df, agg_q, agg_author)
 
@@ -628,7 +481,12 @@ def run_comment_scorer():
     st.caption("Fetch Metaculus comments and rate quality with an LLM. Exports raw and aggregated CSVs.")
     colA, colB = st.columns([2,1])
     with colA:
-        mode = st.radio("Mode", ["Score recent questions", "Score specific IDs", "By commenter ID", "By tournament URL/slug", "Tournament ID Retrieve (file)"], horizontal=True)
+        # Removed: "By commenter ID", "By tournament URL/slug", "Tournament ID Retrieve (file)"
+        mode = st.radio(
+            "Mode",
+            ["Score recent questions", "Score specific IDs", "Tournament (by numeric ID)"],
+            horizontal=True
+        )
     with colB:
         if st.button("🔁 Press here for a new run", key="newrun_score_top"):
             start_new_run()
@@ -636,15 +494,13 @@ def run_comment_scorer():
     model_choice = _resolve_model_from_sidebar("DEFAULT")
     comments_limit = st.number_input("Max comments per question", min_value=10, max_value=500, value=120, step=10)
 
-    # Inputs inside a form: nothing runs until submit is pressed.
     with st.form("scorer_form", clear_on_submit=False):
         qids: List[int] = []
-        commenter_id = None
-        only_author = True
-        tournament_text = ""
+        tournament_id = None
 
         if mode == "Score recent questions":
-            n = st.number_input("Number of recent questions", min_value=1, max_value=100, value=10, step=1, key="recent_n")
+            n = st.number_input("Number of recent open questions", min_value=1, max_value=100, value=10, step=1, key="recent_n")
+
         elif mode == "Score specific IDs":
             qids_str = st.text_area("Metaculus Question IDs (comma or space separated)",
                                     placeholder="Example: 12345, 67890, 13579", key="ids_str")
@@ -654,126 +510,66 @@ def run_comment_scorer():
                         qids.append(int(chunk))
                     except ValueError:
                         pass
-        elif mode == "By commenter ID":
-            commenter_id = st.number_input("Commenter (author) ID", min_value=1, step=1, value=1)
-            only_author = st.checkbox("Score only this author's comments (ignore others)", value=True)
-        elif mode == "By tournament URL/slug":
-            tournament_text = st.text_input(
-                "Tournament URL or slug",
-                value="https://www.metaculus.com/tournament/colombia-wage-watch/",
-                help="Exemples: full URL, 'tournament/colombia-wage-watch/', or just 'colombia-wage-watch'"
-            )
 
-        
-        elif mode == "Tournament ID Retrieve (file)":
-            uploaded_file = st.file_uploader(
-                "Upload tournament page source (HTML/TXT)",
-                type=["html", "htm", "txt"],
-                accept_multiple_files=False,
-                key="tournament_file_uploader",
-                help="Open the tournament page → View Page Source → Save as .html, then upload it here."
-            )
+        elif mode == "Tournament (by numeric ID)":
+            tournament_id = st.number_input("Tournament ID (numeric)", min_value=1, step=1, value=1, help="Enter a numeric ID (e.g., 32821).")
+
         submitted = st.form_submit_button("▶️ Run scoring", type="primary")
 
     if submitted:
         rows: List[Dict[str, Any]] = []
         try:
             model = model_choice
+
+            # ---- Resolve subjects based on mode ----
             if mode == "Score recent questions":
                 subjects = fetch_recent_questions(n_subjects=int(st.session_state.get("recent_n", 10)), page_limit=80)
-            elif mode == "Tournament ID Retrieve (file)":
-                subjects = []
-                html_data = ""
-                if 'uploaded_file' in locals() and uploaded_file is not None:
-                    try:
-                        html_data = uploaded_file.read().decode("utf-8", "ignore")
-                    except Exception:
-                        html_data = ""
-                if not html_data:
-                    st.warning("Please upload a tournament page source file (HTML/TXT).")
-                else:
-                    post_ids = extract_tournament_post_ids(html_data)
-                    if not post_ids:
-                        fallback_ids = extract_question_ids_from_html(html_data)
-                        if fallback_ids:
-                            st.info(f"Fallback used: found {len(fallback_ids)} question IDs via /questions/ references.")
-                            post_ids = fallback_ids
-                    if not post_ids:
-                        st.warning("No IDs found in the uploaded file.")
-                    else:
-                        for qid in post_ids:
-                            s = fetch_question_by_id(qid)
-                            if s:
-                                subjects.append(s)
-                        try:
-                            if subjects:
-                                df_ids = pd.DataFrame([{
-                                    "question_id": s.get("id"),
-                                    "title": (s.get("title") or s.get("name") or ""),
-                                    "url": f"{BASE}/questions/{s.get('id')}/"
-                                } for s in subjects])
-                                with st.expander("Tournament questions found (from file)", expanded=False):
-                                    st.dataframe(df_ids, use_container_width=True, height=260)
-                                    st.download_button("⬇️ Download tournament questions (CSV)",
-                                                       data=df_ids.to_csv(index=False).encode("utf-8"),
-                                                       file_name="tournament_questions_from_file.csv",
-                                                       mime="text/csv",
-                                                       key="dl_tourn_file_ids_csv")
-                                    if st.button("➡️ Send these IDs to 'Score specific IDs' (from file)"):
-                                        st.session_state["ids_str"] = " ".join(str(x) for x in df_ids["question_id"].tolist())
-                                        st.success("IDs copied to the 'Score specific IDs' input.")
-                        except Exception as _e:
-                            st.warning(f"Could not build CSV for IDs (file mode): {_e}")
 
             elif mode == "Score specific IDs":
                 subjects = []
                 for q in qids:
                     s = fetch_question_by_id(q)
                     if s: subjects.append(s)
-            elif mode == "By commenter ID":
-                all_comments = fetch_comments_by_author(int(commenter_id), page_limit=int(comments_limit))
-                post_ids = []
-                for c in all_comments:
-                    pid = c.get("post") or c.get("post_id") or c.get("discussion") or None
-                    if isinstance(pid, int):
-                        post_ids.append(pid)
-                post_ids = sorted(set(post_ids))[:200]
-                subjects = []
-                for pid in post_ids:
-                    s = fetch_question_by_id(pid)
-                    if s: subjects.append(s)
-            elif mode == "By tournament URL/slug":
-                subjects = fetch_questions_by_tournament_url(tournament_text, max_pages=30, sleep_s=0.2)
-                if not subjects:
-                    slug = extract_tournament_slug(tournament_text)
-                    subjects = fetch_questions_by_tournament_slug(slug)
 
-                # -- CSV export of found tournament questions + helper to pre-fill "Score specific IDs" --
-                try:
-                    if subjects:
-                        df_ids = pd.DataFrame([{
-                            "question_id": s.get("id"),
-                            "title": (s.get("title") or s.get("name") or ""),
-                            "url": f"{BASE}/questions/{s.get('id')}/"
-                        } for s in subjects])
-                        with st.expander("Tournament questions found", expanded=False):
-                            st.dataframe(df_ids, use_container_width=True, height=260)
-                            st.download_button("⬇️ Download tournament questions (CSV)",
-                                               data=df_ids.to_csv(index=False).encode("utf-8"),
-                                               file_name="tournament_questions.csv",
-                                               mime="text/csv",
-                                               key="dl_tourn_ids_csv")
-                            if st.button("➡️ Send these IDs to 'Score specific IDs'"):
-                                st.session_state["ids_str"] = " ".join(str(x) for x in df_ids["question_id"].tolist())
-                                st.success("IDs copied to the 'Score specific IDs' input.")
-                except Exception as _e:
-                    st.warning(f"Could not build CSV for IDs: {_e}")
+            elif mode == "Tournament (by numeric ID)":
+                if not tournament_id:
+                    st.warning("Please provide a valid tournament ID.")
+                    subjects = []
+                else:
+                    # Retrieve list of questions via API using numeric ID
+                    subjects = fetch_questions_by_tournament_id(int(tournament_id), debug=st.session_state.get("DEBUG", False))
+
+                    # Export helper CSV of IDs (visible + downloadable)
+                    try:
+                        if subjects:
+                            df_ids = pd.DataFrame([{
+                                "question_id": s.get("id"),
+                                "title": (s.get("title") or s.get("name") or ""),
+                                "url": f"{BASE}/questions/{s.get('id')}/"
+                            } for s in subjects])
+                            with st.expander("Tournament questions found", expanded=False):
+                                st.dataframe(df_ids, use_container_width=True, height=260)
+                                st.download_button(
+                                    "⬇️ Download tournament questions (CSV)",
+                                    data=df_ids.to_csv(index=False).encode("utf-8"),
+                                    file_name="tournament_questions.csv",
+                                    mime="text/csv",
+                                    key="dl_tourn_ids_csv"
+                                )
+                                # Shortcut to prefill "Score specific IDs"
+                                if st.button("➡️ Send these IDs to 'Score specific IDs'"):
+                                    st.session_state["ids_str"] = " ".join(str(x) for x in df_ids["question_id"].tolist())
+                                    st.success("IDs copied to the 'Score specific IDs' input.")
+                    except Exception as _e:
+                        st.warning(f"Could not build CSV for IDs: {_e}")
+
             else:
                 subjects = []
 
             if not subjects:
                 st.warning("No questions found.")
             else:
+                # ---- Scoring loop ----
                 prog = st.progress(0.0)
                 status = st.empty()
                 total = len(subjects)
@@ -781,10 +577,6 @@ def run_comment_scorer():
                     status.info(f"Processing {i}/{total}: [{s['id']}] {s['title']}")
                     comments = fetch_comments_for_post(s["id"], page_limit=int(comments_limit))
                     for c in comments:
-                        if mode == "By commenter ID" and only_author:
-                            a_id = (c.get("author") or {}).get("id")
-                            if int(a_id or -1) != int(commenter_id):
-                                continue
                         text = " ".join((c.get("text") or "").split())
                         if not text:
                             continue
@@ -815,6 +607,7 @@ def run_comment_scorer():
             st.error(f"Error: {e}")
             rows = []
 
+        # ---- Aggregate + persistent state for downloads ----
         if rows:
             df = pd.DataFrame(rows)
             agg_q = (
@@ -833,7 +626,6 @@ def run_comment_scorer():
                        p_high=("ai_score", lambda x: (x>=4).mean()))
                   .reset_index()
             )
-            # Persist so ANY rerun (e.g., a download click) shows the same data without recompute
             st.session_state["score_df"] = df
             st.session_state["score_agg_q"] = agg_q
             st.session_state["score_agg_author"] = agg_author
@@ -843,13 +635,12 @@ def run_comment_scorer():
         df = st.session_state["score_df"]
         agg_q = st.session_state.get("score_agg_q", pd.DataFrame())
         agg_author = st.session_state.get("score_agg_author", pd.DataFrame())
-        # This reruns ONLY the fragment when available; otherwise it’s a no-op that keeps state.
         downloads_fragment(df, agg_q, agg_author)
     else:
         st.info("No comments were scored.")
 
 # ================================
-# Stubs for the other modules (unchanged in this patch)
+# Stubs for the other modules (unchanged)
 # ================================
 
 def run_question_factors():
@@ -928,8 +719,6 @@ else:
     run_question_factors()
 
 st.caption("Tip: add OPENROUTER_API_KEY in app secrets (Settings → Secrets) or enter it here.")
-
-
 
 
 
