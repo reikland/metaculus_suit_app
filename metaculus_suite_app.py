@@ -246,6 +246,9 @@ def parse_json_relaxed(s: str, expect: str = "auto") -> Any:
 
 
 def start_new_run():
+    global _cache_score
+    _cache_score.clear()  # reset du cache de scoring pour permettre le changement de modèle
+
     for k in [
         "score_df",
         "score_agg_q",
@@ -495,7 +498,7 @@ def build_msgs_score(qtitle: str, qurl: str, text: str, cid: int, aid: Optional[
         "Rate this comment for quality.\n\n"
         f"QUESTION_TITLE: {qtitle}\nQUESTION_URL: {qurl}\n\n"
         f"COMMENT_ID: {cid}\nAUTHOR_ID: {aid}\nVOTE_SCORE: {votes}\nTEXT:\n{text}\n\n"
-        'Return JSON: {"score":1|2|3|4|5,"rationale":"...",'
+        'Return JSON: {"score":1|2|3|4|5|6,"rationale":"...",'
         '"flags":{"off_topic":bool,"toxicity":bool,"low_effort":bool,"has_evidence":bool,"likely_ai":bool},'
         '"evidence_urls":["..."]}'
     )
@@ -507,7 +510,9 @@ _cache_score: Dict[str, Dict[str, Any]] = {}
 
 def score_with_llm(qtitle: str, qurl: str, c: Dict[str, Any], model: str) -> Dict[str, Any]:
     text = (c.get("text") or "").strip()
-    key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    # clé de cache inclut le modèle pour permettre le vrai switch de LLM
+    cache_key_raw = f"{model}||{text}"
+    key = hashlib.sha256(cache_key_raw.encode("utf-8")).hexdigest()
     if key not in _cache_score:
         msgs = build_msgs_score(qtitle, qurl, text, c.get("id"), (c.get("author") or {}).get("id"), c.get("vote_score"))
         resp = call_openrouter(
@@ -607,6 +612,9 @@ def run_comment_scorer():
             start_new_run()
 
     model_choice = _resolve_model_from_sidebar("DEFAULT")
+    # Debug : afficher le modèle effectivement utilisé par le scorer
+    st.caption(f"🧠 Model used for this run: `{model_choice}`")
+
     comments_limit = st.number_input(
         "Max comments per question",
         min_value=10,
@@ -756,7 +764,8 @@ def run_comment_scorer():
                         a = c.get("author") or {}
                         resp = score_with_llm(s.get("title", ""), s.get("url", ""), c, model)
                         try:
-                            score = int(max(1, min(5, round(float(resp.get("score", 3))))))
+                            # échelle 1..6, clampée proprement
+                            score = int(max(1, min(6, round(float(resp.get("score", 3))))))
                         except Exception:
                             score = 3
                         rows.append(
@@ -815,6 +824,7 @@ def run_comment_scorer():
         downloads_fragment(df, agg_q, agg_author)
     else:
         st.info("No comments were scored.")
+
 
 
 # ================================
