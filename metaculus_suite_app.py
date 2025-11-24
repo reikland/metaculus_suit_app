@@ -80,7 +80,11 @@ def get_openrouter_key() -> str:
     return v
 
 
-def or_headers(x_title: str = "Metaculus Suite", referer: str = "https://localhost", user_agent: str = "metaculus-suite/1.0") -> Dict[str, str]:
+def or_headers(
+    x_title: str = "Metaculus Suite",
+    referer: str = "https://localhost",
+    user_agent: str = "metaculus-suite/1.0",
+) -> Dict[str, str]:
     key = get_openrouter_key()
     if not key:
         raise RuntimeError("Missing OPENROUTER_API_KEY")
@@ -162,14 +166,38 @@ def _resolve_model_from_sidebar(base_key: str, fallback: Optional[str] = None) -
     return pick_model(fallback)
 
 
-def call_openrouter(messages: List[Dict[str, str]], model: str, max_tokens: int = 220, temperature: float = 0.0,
-                    retries: int = 3, expect: str = "object", title_hint: str = "Metaculus Comment Scorer",
-                    ua_hint: str = "metaculus-comments-llm-scorer/1.1") -> Any:
-    payload = {"model": model, "messages": messages, "temperature": temperature, "top_p": 1, "max_tokens": max_tokens}
+def call_openrouter(
+    messages: List[Dict[str, str]],
+    model: str,
+    max_tokens: int = 220,
+    temperature: float = 0.0,
+    retries: int = 3,
+    expect: str = "object",  # "object" | "array" | "raw"
+    title_hint: str = "Metaculus Comment Scorer",
+    ua_hint: str = "metaculus-comments-llm-scorer/1.1",
+) -> Any:
+    """
+    Wrapper around the OpenRouter chat API.
+
+    - If expect == "raw": returns the raw text content (no JSON parsing).
+    - Else: parse JSON using parse_json_relaxed with the given expectation.
+    """
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "top_p": 1,
+        "max_tokens": max_tokens,
+    }
     last = None
     for k in range(retries):
         try:
-            r = requests.post(OPENROUTER_URL, headers=or_headers(title_hint, user_agent=ua_hint), json=payload, timeout=120)
+            r = requests.post(
+                OPENROUTER_URL,
+                headers=or_headers(title_hint, user_agent=ua_hint),
+                json=payload,
+                timeout=120,
+            )
             if r.status_code == 404:
                 raise RuntimeError("404 No endpoints for model")
             if r.status_code == 429:
@@ -186,6 +214,8 @@ def call_openrouter(messages: List[Dict[str, str]], model: str, max_tokens: int 
             content = ch[0].get("message", {}).get("content", "")
             if not content:
                 raise RuntimeError("Empty content")
+            if expect == "raw":
+                return content
             return parse_json_relaxed(content, expect=expect)
         except Exception as e:
             last = e
@@ -199,6 +229,8 @@ def parse_json_relaxed(s: str, expect: str = "auto") -> Any:
         return json.loads(s)
     except Exception:
         pass
+
+    # Try fenced code block
     m = re.search(r"```(?:json)?\s*(.*?)\s*```", s, flags=re.DOTALL | re.IGNORECASE)
     if m:
         try:
@@ -228,12 +260,14 @@ def parse_json_relaxed(s: str, expect: str = "auto") -> Any:
                 return json.loads(blk)
             except Exception:
                 pass
+
     blk = balanced_slice(s, "{", "}")
     if blk:
         try:
             return json.loads(blk)
         except Exception:
             pass
+
     objs = []
     for m in re.finditer(r"\{.*?\}", s, flags=re.DOTALL):
         try:
@@ -402,129 +436,217 @@ def parse_question_csv_rows(data: bytes) -> List[Dict[str, Any]]:
 # Comment Scorer (LLM)
 # ================================
 
-SYSTEM_PROMPT_SCORE = (
-"You are a strict comment rater at Metaculus, rating comments for the AI Pathways Tournament.\n\n"
-"Context: The AI Pathways Tournament (Foresight Institute’s Existential Hope program) explores two futures shaped by different AI development approaches:\n"
-"- Tool AI Pathway: powerful but controllable, limited-agency AI scaled to augment humans in science, healthcare, and governance, without AGI.\n"
-"- d/acc Pathway: decentralized, democratic, defensive acceleration of technology, with modular, privacy-preserving systems enabling bottom-up innovation.\n\n"
-"Return ONLY valid JSON with keys:\n"
-"- score (integer 1..6)\n"
-"- rationale (string, <=180 chars)\n"
-"- flags (object with booleans: off_topic, toxicity, low_effort, has_evidence, likely_ai)\n"
-"- evidence_urls (array of http/https URLs; <=5, deduplicated; MUST be [] if has_evidence=false)\n\n"
-"Primary goal: reward deep, decision-useful analysis that helps update forecasts and understand the two AI pathways and their interactions, even with few/no links.\n\n"
-"Scoring rubric (weighting guidance):\n"
-"- Mechanistic depth & scenario reasoning (40%): clear, insightful reasoning about causal mechanisms, Tool vs d/acc pathways, and how they shape the question’s outcome.\n"
-"- Cross-question & pathway insight (30%): links between questions, tournaments, and the two pathways; how outcomes cohere across the overall scenario space.\n"
-"- Evidence & information value (20%): brings in relevant facts, references, or well-grounded analogies that materially inform the scenario or base rates.\n"
-"- Challenging assumptions (10%): identifies and critiques common community assumptions or forecast clusters; proposes alternative hypotheses.\n\n"
-"Anchor points:\n"
-"1 = trivial, badly written, or unreasonable; no predictive or scenario value.\n"
-"2 = brief or slightly confused; only surface-level insight into the question or pathways.\n"
-"3 = good comment with rational arguments or potentially useful info; some relevance to Tool/d/acc but limited depth or linkage.\n"
-"4 = very good comment with solid, detailed reasoning; explains mechanisms, gives actionable information, and clearly engages with one or both pathways.\n"
-"5 = excellent comment: meaningful, well-structured analysis, deep dive into available information, draws original conclusions about Tool vs d/acc futures and their implications.\n"
-"6 = standout synthesis: decomposes uncertainty, connects multiple questions/pathways, and clearly indicates how and why forecasts should shift.\n\n"
-"Edge rules:\n"
-"- Be conservative with score inflation; reserve 6 for analysis that is clearly exceptional within the tournament.\n"
-"- Penalize source/link dumps with little or no reasoning or forecast impact.\n"
-"- Long, generic, or boilerplate-sounding text with little specificity -> likely_ai=true.\n"
-"- Clarity & civility are required; toxic or incoherent comments should be scored low and toxicity flagged.\n"
-"- Rationale must be <=180 chars; explain briefly why the score was given, focusing on reasoning depth, scenario insight, and forecast usefulness.\n"
-"- Output JSON only, no surrounding text.\n"
-)
+# >>> FIRST STAGE: BIG / VERBOSE MODEL WITH EXIGEANT SCORING CRITERIA <<<
+SYSTEM_PROMPT_SCORE = """
+You must rate Metaculus comments for quality in the AI Pathways Tournament.
 
+Your output in this FIRST STAGE may be FREE-FORM NATURAL LANGUAGE.
+You DO NOT need to output JSON here.
+
+TASK:
+- Read the comment and question context.
+- Decide on:
+  - score: integer 1..6
+  - rationale: short textual justification (<=180 chars ideally)
+  - flags: off_topic, toxicity, low_effort, has_evidence, likely_ai
+  - evidence_urls: any http/https URLs referenced or clearly implied
+
+FOCUS (STRUCTURE FOR THE SECOND STAGE):
+- Be clear and explicit about the rating you choose.
+- Mention the score explicitly as "score = X".
+- Mention flags explicitly, e.g. "flags: off_topic=false, toxicity=false, low_effort=true, has_evidence=false, likely_ai=false".
+- List evidence URLs explicitly, or say "evidence_urls: []" if none.
+
+SCORING WEIGHTS (THESE ARE STRICT AND MUST BE TAKEN SERIOUSLY):
+The comments should be ranked based on how well they:
+- Showcase clear, deep, and insightful reasoning, delving into the relevant mechanisms that affect the event in question. (40%)
+- Offer useful insights about the overall scenario(s), the interactions between questions, or the relationship between the questions and the scenario(s). (30%)
+- Provide valuable information and are based on the available evidence. (20%)
+- Challenge the community's prediction or assumptions held by other forecasters. (10%)
+
+ANCHOR POINTS (1–6 SCALE):
+The comments do not need to have all the following characteristics; one strong attribute can sometimes compensate for weaker ones.
+Use these anchors when deciding the score:
+
+1 = Trivial, badly written, or completely unreasonable comment with no predictive value.
+2 = Brief or slightly confused comment offering only surface value.
+3 = Good comment with rational arguments or potentially useful information.
+4 = Very good comment which explains solid reasoning in some detail and provides actionable information.
+5 = Excellent comment with meaningful analysis, presenting a deep dive of the available information and arguments, and drawing original conclusions from it.
+6 = Outstanding synthesis comment which clearly decomposes uncertainty, connects multiple questions or scenarios, and gives a compelling reason to significantly update forecasts.
+
+ADDITIONAL CONSTRAINTS:
+- Be conservative with high scores (5 and especially 6). Reserve them for comments that are clearly above the tournament median in insight and usefulness.
+- Penalize comments that are long but vague, generic, or boilerplate.
+- Penalize pure link dumps with little or no reasoning or forecast impact.
+- Toxic or uncivil comments should receive low scores and toxicity=true.
+
+FLAGS INTERPRETATION:
+- off_topic: true if the comment is largely unrelated to the question or the AI Pathways scenario.
+- toxicity: true if the comment is hostile, insulting, or clearly uncivil.
+- low_effort: true if the comment is very short, trivial, or adds almost nothing.
+- has_evidence: true if the comment brings specific data, references, links, or clearly factual information.
+- likely_ai: true if the comment is long, generic, and boilerplate-sounding with little specificity or real engagement.
+
+You may think and explain briefly here, but you MUST keep the structure obvious
+so that a second model can reliably convert it into strict JSON.
+"""
+
+# SECOND STAGE: small model → STRICT JSON CONVERTER
+SYSTEM_PROMPT_JSON_CONVERT = """
+You convert free-form rating text into STRICT JSON with this exact schema:
+{
+  "score": 1|2|3|4|5|6,
+  "rationale": "<string, <=180 chars>",
+  "flags": {
+    "off_topic": true|false,
+    "toxicity": true|false,
+    "low_effort": true|false,
+    "has_evidence": true|false,
+    "likely_ai": true|false
+  },
+  "evidence_urls": ["<string>", "..."]
+}
+
+HARD RULES:
+1. OUTPUT STRICT JSON ONLY.
+   - No explanations
+   - No comments
+   - No Markdown
+   - No code fences
+   - No extra keys
+   - No trailing commas
+
+2. DO NOT THINK "OUT LOUD".
+   - No chain-of-thought in the output.
+   - No meta commentary.
+
+3. If some information is missing in the raw text:
+   - Use a safe default:
+     - score: 3 if unclear
+     - rationale: ""
+     - flags: false for all unless clearly indicated
+     - evidence_urls: [] if none clearly extractable
+
+4. You MUST:
+   - Parse any explicit "score = X" or similar notation.
+   - Parse any obvious booleans for the flags.
+   - Collect any http/https URLs as evidence_urls (deduplicate).
+
+5. Final answer:
+   - ONE JSON object
+   - EXACTLY matching the schema above
+   - No natural language outside JSON.
+"""
 
 FEWSHOTS_SCORE = [
     {"role": "user", "content": "TEXT: Thanks for sharing!"},
     {
         "role": "assistant",
-        "content": json.dumps(
-            {
-                "score": 1,
-                "rationale": "Trivial acknowledgement only.",
-                "flags": {
-                    "off_topic": False,
-                    "toxicity": False,
-                    "low_effort": True,
-                    "has_evidence": False,
-                    "likely_ai": False,
-                },
-                "evidence_urls": [],
-            }
-        ),
+        "content": "score = 1\nrationale: Trivial acknowledgement only.\nflags: off_topic=false, toxicity=false, low_effort=true, has_evidence=false, likely_ai=false\nevidence_urls: []",
     },
     {"role": "user", "content": "TEXT: Anyone who thinks this will happen is an idiot."},
     {
         "role": "assistant",
-        "content": json.dumps(
-            {
-                "score": 1,
-                "rationale": "Toxic with no evidence.",
-                "flags": {
-                    "off_topic": False,
-                    "toxicity": True,
-                    "low_effort": True,
-                    "has_evidence": False,
-                    "likely_ai": False,
-                },
-                "evidence_urls": [],
-            }
-        ),
+        "content": "score = 1\nrationale: Toxic with no evidence.\nflags: off_topic=false, toxicity=true, low_effort=true, has_evidence=false, likely_ai=false\nevidence_urls: []",
     },
     {"role": "user", "content": "TEXT: Turnout fell 3–5% vs 2020 in key counties (CSV). I estimate P(win)=0.56."},
     {
         "role": "assistant",
-        "content": json.dumps(
-            {
-                "score": 5,
-                "rationale": "Quantified comparison with evidence pointer.",
-                "flags": {
-                    "off_topic": False,
-                    "toxicity": False,
-                    "low_effort": False,
-                    "has_evidence": True,
-                    "likely_ai": False,
-                },
-                "evidence_urls": [],
-            }
-        ),
+        "content": "score = 5\nrationale: Quantified comparison with evidence pointer.\nflags: off_topic=false, toxicity=false, low_effort=false, has_evidence=true, likely_ai=false\nevidence_urls: []",
     },
 ]
 
 
-def build_msgs_score(qtitle: str, qurl: str, text: str, cid: int, aid: Optional[int], votes: Optional[int]) -> List[Dict[str, str]]:
+def build_msgs_score(
+    qtitle: str,
+    qurl: str,
+    text: str,
+    cid: int,
+    aid: Optional[int],
+    votes: Optional[int],
+) -> List[Dict[str, str]]:
+    """
+    First-stage message: big/verbose model does free-form rating.
+    """
     u = (
-        "Rate this comment for quality.\n\n"
+        "Rate this comment for quality in FREE-FORM TEXT (FIRST STAGE).\n\n"
         f"QUESTION_TITLE: {qtitle}\nQUESTION_URL: {qurl}\n\n"
         f"COMMENT_ID: {cid}\nAUTHOR_ID: {aid}\nVOTE_SCORE: {votes}\nTEXT:\n{text}\n\n"
-        'Return JSON: {"score":1|2|3|4|5|6,"rationale":"...",'
-        '"flags":{"off_topic":bool,"toxicity":bool,"low_effort":bool,"has_evidence":bool,"likely_ai":bool},'
-        '"evidence_urls":["..."]}'
+        "You MUST:\n"
+        "- Explicitly write the score as 'score = X' (X in 1..6).\n"
+        "- Provide a short rationale line starting with 'rationale:'.\n"
+        "- Provide flags in one line starting with 'flags:' and including all booleans.\n"
+        "- Provide 'evidence_urls: [...]' listing URLs or [].\n\n"
+        "Do NOT output JSON in this stage.\n"
     )
     return [{"role": "system", "content": SYSTEM_PROMPT_SCORE}] + FEWSHOTS_SCORE + [{"role": "user", "content": u}]
+
+
+def build_msgs_json_convert(raw_text: str) -> List[Dict[str, str]]:
+    """
+    Second-stage message: small model converts raw free-form into strict JSON.
+    """
+    u = (
+        "Here is the raw rating text from another model:\n\n"
+        f"{raw_text}\n\n"
+        "Convert this into ONE JSON object following the schema exactly. "
+        "Remember: JSON only, no Markdown, no explanations."
+    )
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT_JSON_CONVERT},
+        {"role": "user", "content": u},
+    ]
 
 
 _cache_score: Dict[str, Dict[str, Any]] = {}
 
 
 def score_with_llm(qtitle: str, qurl: str, c: Dict[str, Any], model: str) -> Dict[str, Any]:
+    """
+    Two-stage scoring pipeline:
+    1) Big model (chosen by user) does free-form rating text.
+    2) Small model (hard-coded gpt-4o-mini) converts that text into strict JSON.
+    """
     text = (c.get("text") or "").strip()
-    # clé de cache inclut le modèle pour permettre le vrai switch de LLM
     cache_key_raw = f"{model}||{text}"
     key = hashlib.sha256(cache_key_raw.encode("utf-8")).hexdigest()
+
     if key not in _cache_score:
-        msgs = build_msgs_score(qtitle, qurl, text, c.get("id"), (c.get("author") or {}).get("id"), c.get("vote_score"))
-        resp = call_openrouter(
-            msgs,
+        # ---- Stage 1: big / verbose model, raw free-form ----
+        msgs_stage1 = build_msgs_score(
+            qtitle,
+            qurl,
+            text,
+            c.get("id"),
+            (c.get("author") or {}).get("id"),
+            c.get("vote_score"),
+        )
+        raw_output = call_openrouter(
+            msgs_stage1,
             model,
+            max_tokens=300,
+            temperature=0.0,
+            expect="raw",  # <== important: no JSON parsing here
+            title_hint="Metaculus Comment Scorer – Stage 1 (Raw)",
+            ua_hint="metaculus-comments-llm-scorer-stage1/1.0",
+        )
+
+        # ---- Stage 2: small robust model → strict JSON ----
+        converter_model = "openai/gpt-4o-mini"
+        msgs_stage2 = build_msgs_json_convert(raw_output)
+        json_output = call_openrouter(
+            msgs_stage2,
+            converter_model,
             max_tokens=220,
             temperature=0.0,
             expect="object",
-            title_hint="Metaculus Comment Scorer",
-            ua_hint="metaculus-comments-llm-scorer/1.1",
+            title_hint="Metaculus Comment Scorer – JSON Convert",
+            ua_hint="metaculus-comments-json-convert/1.0",
         )
-        _cache_score[key] = resp
+
+        _cache_score[key] = json_output
+
     return _cache_score[key]
 
 # ================================
@@ -612,8 +734,8 @@ def run_comment_scorer():
             start_new_run()
 
     model_choice = _resolve_model_from_sidebar("DEFAULT")
-    # Debug : afficher le modèle effectivement utilisé par le scorer
-    st.caption(f"🧠 Model used for this run: `{model_choice}`")
+    st.caption(f"🧠 Model used for STAGE 1 (raw rating): `{model_choice}`")
+    st.caption("📏 STAGE 2 (JSON convert) uses `openai/gpt-4o-mini` hard-coded.")
 
     comments_limit = st.number_input(
         "Max comments per question",
@@ -716,9 +838,8 @@ def run_comment_scorer():
                         subjects = [
                             {
                                 "id": r.get("question_id") or r.get("post_id"),
-                                "title": r.get("title") or (f"Post {r.get('post_id')}") ,
+                                "title": r.get("title") or (f"Post {r.get('post_id')}"),
                                 "url": r.get("url") or (f"{BASE}/posts/{r.get('post_id')}/"),
-                                # body not required for scoring prompt
                             }
                             for r in rows_sel
                         ]
@@ -744,17 +865,14 @@ def run_comment_scorer():
 
                     # In Artelar mode we must fetch comments by POST ID if available
                     if mode == "Tournament (Artelar CSV)":
-                        # map subject to post_id; fallback to using subject id directly
                         sid = int(s["id"]) if s.get("id") is not None else None
                         post_id = None
                         if sid is not None and 'subj_to_post' in locals():
                             post_id = subj_to_post.get(sid)
                         if not post_id:
-                            # fallback: attempt to use id as post id
                             post_id = sid
                         comments = fetch_comments_for_post(int(post_id), page_limit=int(comments_limit)) if post_id else []
                     else:
-                        # In the other modes, Metaculus comment endpoint expects 'post' (same as question id for questions)
                         comments = fetch_comments_for_post(int(s["id"]), page_limit=int(comments_limit))
 
                     for c in comments:
@@ -764,7 +882,6 @@ def run_comment_scorer():
                         a = c.get("author") or {}
                         resp = score_with_llm(s.get("title", ""), s.get("url", ""), c, model)
                         try:
-                            # échelle 1..6, clampée proprement
                             score = int(max(1, min(6, round(float(resp.get("score", 3))))))
                         except Exception:
                             score = 3
@@ -883,7 +1000,7 @@ with st.sidebar:
         if (model_ids or [default_model_id])
         else 0,
         key="MODEL_DEFAULT",
-        help="Used by Comment Scorer and Question Factors unless a custom model ID is set below.",
+        help="Used by Comment Scorer (stage 1) and Question Factors unless a custom model ID is set below.",
     )
     st.text_input(
         "Custom model ID (optional)",
