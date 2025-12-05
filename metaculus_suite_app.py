@@ -438,18 +438,33 @@ def parse_question_csv_rows(data: bytes) -> List[Dict[str, Any]]:
 
 # >>> FIRST STAGE: BIG / VERBOSE MODEL WITH EXIGEANT SCORING CRITERIA <<<
 SYSTEM_PROMPT_SCORE = """
-You must rate Metaculus comments for quality in the AI Pathways Tournament.
+You are a narrow scoring module inside a larger pipeline.
+Your ONLY job is to rate Metaculus comments for quality in the AI Pathways Tournament.
+
+You are NOT a general-purpose assistant.
+Do NOT brainstorm, speculate, or explore side topics.
+Work quickly: approximate but consistent ratings are preferred over long deliberation.
 
 Your output in this FIRST STAGE may be FREE-FORM NATURAL LANGUAGE.
 You DO NOT need to output JSON here.
 
 TASK:
-- Read the comment and question context.
+- Read the comment, the question context, and (if present) the parent comment.
+- If a parent comment is provided, treat the comment as a reply and assess:
+  - how well it answers the parent,
+  - how accurately it engages with the parent's claims,
+  - and whether it productively advances the discussion.
 - Decide on:
   - score: integer 1..6
-  - rationale: short textual justification (<=180 chars ideally)
+  - rationale: short textual justification (<=180 chars ideally, absolutely no long paragraphs)
   - flags: off_topic, toxicity, low_effort, has_evidence, likely_ai
   - evidence_urls: any http/https URLs referenced or clearly implied
+
+STRICT FORMAT AND BREVITY:
+- Keep the answer short and structured.
+- Aim for at most 6–8 short lines total.
+- NO headings, NO bullet lists, NO meta commentary.
+- Do NOT think out loud; just produce the final decision.
 
 FOCUS (STRUCTURE FOR THE SECOND STAGE):
 - Be clear and explicit about the rating you choose.
@@ -480,6 +495,7 @@ ADDITIONAL CONSTRAINTS:
 - Penalize comments that are long but vague, generic, or boilerplate.
 - Penalize pure link dumps with little or no reasoning or forecast impact.
 - Toxic or uncivil comments should receive low scores and toxicity=true.
+- When in doubt between two adjacent scores, pick the lower one quickly rather than overthinking.
 
 FLAGS INTERPRETATION:
 - off_topic: true if the comment is largely unrelated to the question or the AI Pathways scenario.
@@ -488,9 +504,9 @@ FLAGS INTERPRETATION:
 - has_evidence: true if the comment brings specific data, references, links, or clearly factual information.
 - likely_ai: true if the comment is long, generic, and boilerplate-sounding with little specificity or real engagement.
 
-You may think and explain briefly here, but you MUST keep the structure obvious
-so that a second model can reliably convert it into strict JSON.
+You must stay strictly on task: rate, justify briefly, set flags, list URLs. Nothing else.
 """
+
 
 # SECOND STAGE: small model → STRICT JSON CONVERTER
 SYSTEM_PROMPT_JSON_CONVERT = """
@@ -565,13 +581,20 @@ def build_msgs_score(
     cid: int,
     aid: Optional[int],
     votes: Optional[int],
+    parent_text: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """
     First-stage message: big/verbose model does free-form rating.
+    Includes optional parent comment text to evaluate reply quality.
     """
+    parent_block = ""
+    if parent_text:
+        parent_block = f"PARENT_COMMENT_TEXT:\n{parent_text}\n\n"
+
     u = (
         "Rate this comment for quality in FREE-FORM TEXT (FIRST STAGE).\n\n"
         f"QUESTION_TITLE: {qtitle}\nQUESTION_URL: {qurl}\n\n"
+        f"{parent_block}"
         f"COMMENT_ID: {cid}\nAUTHOR_ID: {aid}\nVOTE_SCORE: {votes}\nTEXT:\n{text}\n\n"
         "You MUST:\n"
         "- Explicitly write the score as 'score = X' (X in 1..6).\n"
@@ -602,14 +625,23 @@ def build_msgs_json_convert(raw_text: str) -> List[Dict[str, str]]:
 _cache_score: Dict[str, Dict[str, Any]] = {}
 
 
-def score_with_llm(qtitle: str, qurl: str, c: Dict[str, Any], model: str) -> Dict[str, Any]:
+def score_with_llm(
+    qtitle: str,
+    qurl: str,
+    c: Dict[str, Any],
+    model: str,
+    parent_text: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Two-stage scoring pipeline:
     1) Big model (chosen by user) does free-form rating text.
     2) Small model (hard-coded gpt-4o-mini) converts that text into strict JSON.
+
+    Now uses optional parent_text to judge how well the comment replies to its parent.
     """
     text = (c.get("text") or "").strip()
-    cache_key_raw = f"{model}||{text}"
+    parent_sig = (parent_text or "").strip()
+    cache_key_raw = f"{model}||{text}||{parent_sig}"
     key = hashlib.sha256(cache_key_raw.encode("utf-8")).hexdigest()
 
     if key not in _cache_score:
@@ -621,6 +653,7 @@ def score_with_llm(qtitle: str, qurl: str, c: Dict[str, Any], model: str) -> Dic
             c.get("id"),
             (c.get("author") or {}).get("id"),
             c.get("vote_score"),
+            parent_text=parent_text,
         )
         raw_output = call_openrouter(
             msgs_stage1,
@@ -879,8 +912,24 @@ def run_comment_scorer():
                         text = " ".join((c.get("text") or "").split())
                         if not text:
                             continue
+
+                        # ---- NEW: fetch parent comment text if available ----
+                        parent_text = None
+                        parent_id = c.get("parent") or c.get("parent_comment") or c.get("in_reply_to")
+                        if parent_id:
+                            for cp in comments:
+                                if cp.get("id") == parent_id:
+                                    parent_text = (cp.get("text") or "").strip()
+                                    break
+
                         a = c.get("author") or {}
-                        resp = score_with_llm(s.get("title", ""), s.get("url", ""), c, model)
+                        resp = score_with_llm(
+                            s.get("title", ""),
+                            s.get("url", ""),
+                            c,
+                            model,
+                            parent_text=parent_text,
+                        )
                         try:
                             score = int(max(1, min(6, round(float(resp.get("score", 3))))))
                         except Exception:
