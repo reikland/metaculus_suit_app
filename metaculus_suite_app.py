@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
 import io
 import re
@@ -22,7 +25,7 @@ OPENROUTER_MODELS = "https://openrouter.ai/api/v1/models"
 
 BASE = "https://www.metaculus.com"
 API2 = f"{BASE}/api2"
-API  = f"{BASE}/api"
+API = f"{BASE}/api"
 
 # ---- Metaculus token (hardcoded as requested) ----
 METACULUS_TOKEN = "a5217e06384668c082997ec2d5b0c68945497b43".strip()
@@ -42,7 +45,7 @@ UA_DLZIP = {
 
 HTTP_QS = requests.Session()
 HTTP_COM = requests.Session()
-HTTP_DL  = requests.Session()
+HTTP_DL = requests.Session()
 
 PREFERRED_MODELS = [
     "openai/gpt-4o-mini",
@@ -56,9 +59,14 @@ PREFERRED_MODELS = [
     "google/gemma-2-9b-it:free",
 ]
 
+# Truncation limits for model inputs
+MAX_COMMENT_CHARS = 2000
+MAX_PARENT_CHARS = 1500
+
 # ================================
 # Shared helpers
 # ================================
+
 
 def ascii_safe(s: str) -> str:
     try:
@@ -68,7 +76,11 @@ def ascii_safe(s: str) -> str:
 
 
 def get_openrouter_key() -> str:
-    v = st.session_state.get("OPENROUTER_API_KEY_OVERRIDE", "").strip() if "OPENROUTER_API_KEY_OVERRIDE" in st.session_state else ""
+    v = (
+        st.session_state.get("OPENROUTER_API_KEY_OVERRIDE", "").strip()
+        if "OPENROUTER_API_KEY_OVERRIDE" in st.session_state
+        else ""
+    )
     if not v:
         try:
             if "OPENROUTER_API_KEY" in st.secrets:
@@ -108,7 +120,7 @@ def list_models_clean() -> List[Dict[str, Any]]:
         ms = data.get("data") or data.get("models") or []
     except Exception:
         return []
-    out = []
+    out: List[Dict[str, Any]] = []
     for m in ms:
         out.append(
             {
@@ -166,6 +178,63 @@ def _resolve_model_from_sidebar(base_key: str, fallback: Optional[str] = None) -
     return pick_model(fallback)
 
 
+def parse_json_relaxed(s: str, expect: str = "auto") -> Any:
+    s = s.strip()
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+
+    # Try fenced code block
+    m = re.search(r"```(?:json)?\s*(.*?)\s*```", s, flags=re.DOTALL | re.IGNORECASE)
+    if m:
+        inner = m.group(1).strip()
+        try:
+            return json.loads(inner)
+        except Exception:
+            s = inner
+
+    def balanced_slice(s: str, open_char: str, close_char: str) -> Optional[str]:
+        start = s.find(open_char)
+        if start == -1:
+            return None
+        depth = 0
+        for i in range(start, len(s)):
+            c = s[i]
+            if c == open_char:
+                depth += 1
+            elif c == close_char:
+                depth -= 1
+                if depth == 0:
+                    return s[start : i + 1]
+        return None
+
+    if expect in ("array", "auto"):
+        blk = balanced_slice(s, "[", "]")
+        if blk:
+            try:
+                return json.loads(blk)
+            except Exception:
+                pass
+
+    blk = balanced_slice(s, "{", "}")
+    if blk:
+        try:
+            return json.loads(blk)
+        except Exception:
+            pass
+
+    objs: List[Any] = []
+    for m in re.finditer(r"\{.*?\}", s, flags=re.DOTALL):
+        try:
+            objs.append(json.loads(m.group(0)))
+        except Exception:
+            continue
+    if objs:
+        return objs if len(objs) > 1 else objs[0]
+    raise ValueError("Could not parse JSON from model output")
+
+
 def call_openrouter(
     messages: List[Dict[str, str]],
     model: str,
@@ -189,7 +258,7 @@ def call_openrouter(
         "top_p": 1,
         "max_tokens": max_tokens,
     }
-    last = None
+    last: Optional[Exception] = None
     for k in range(retries):
         try:
             r = requests.post(
@@ -223,65 +292,10 @@ def call_openrouter(
     raise RuntimeError(f"[openrouter] giving up after retries: {repr(last)}")
 
 
-def parse_json_relaxed(s: str, expect: str = "auto") -> Any:
-    s = s.strip()
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
-
-    # Try fenced code block
-    m = re.search(r"```(?:json)?\s*(.*?)\s*```", s, flags=re.DOTALL | re.IGNORECASE)
-    if m:
-        try:
-            return json.loads(m.group(1).strip())
-        except Exception:
-            s = m.group(1).strip()
-
-    def balanced_slice(s: str, open_char: str, close_char: str) -> Optional[str]:
-        start = s.find(open_char)
-        if start == -1:
-            return None
-        depth = 0
-        for i in range(start, len(s)):
-            c = s[i]
-            if c == open_char:
-                depth += 1
-            elif c == close_char:
-                depth -= 1
-                if depth == 0:
-                    return s[start : i + 1]
-        return None
-
-    if expect in ("array", "auto"):
-        blk = balanced_slice(s, "[", "]")
-        if blk:
-            try:
-                return json.loads(blk)
-            except Exception:
-                pass
-
-    blk = balanced_slice(s, "{", "}")
-    if blk:
-        try:
-            return json.loads(blk)
-        except Exception:
-            pass
-
-    objs = []
-    for m in re.finditer(r"\{.*?\}", s, flags=re.DOTALL):
-        try:
-            objs.append(json.loads(m.group(0)))
-        except Exception:
-            continue
-    if objs:
-        return objs if len(objs) > 1 else objs[0]
-    raise ValueError("Could not parse JSON from model output")
-
-
 def start_new_run():
     global _cache_score
-    _cache_score.clear()  # reset du cache de scoring pour permettre le changement de modèle
+    # Reset the scoring cache to allow changing model and re-running cleanly
+    _cache_score.clear()
 
     for k in [
         "score_df",
@@ -294,9 +308,11 @@ def start_new_run():
     list_models_clean.clear()
     st.rerun()
 
+
 # ================================
 # Metaculus fetchers (shared)
 # ================================
+
 
 def _get(http: requests.Session, url: str, params: Optional[Dict[str, Any]], ua: Dict[str, str]) -> Dict[str, Any]:
     r = http.get(url, params=params or {}, headers=ua, timeout=30)
@@ -313,11 +329,11 @@ def fetch_recent_questions(n_subjects: int = 10, page_limit: int = 80) -> List[D
     data = _get(HTTP_QS, f"{API2}/questions/", {"status": "open", "limit": page_limit}, UA_QS)
     results = data.get("results") or data.get("data") or []
 
-    def ts(q):
+    def ts(q: Dict[str, Any]) -> str:
         return q.get("open_time") or q.get("created_at") or q.get("scheduled_close_time") or ""
 
     results.sort(key=ts, reverse=True)
-    out = []
+    out: List[Dict[str, Any]] = []
     for q in results[:n_subjects]:
         qid = q.get("id")
         if not qid:
@@ -327,7 +343,11 @@ def fetch_recent_questions(n_subjects: int = 10, page_limit: int = 80) -> List[D
                 "id": qid,
                 "title": q.get("title", ""),
                 "url": q.get("page_url") or q.get("url") or f"{BASE}/questions/{qid}/",
-                "body": q.get("description") or q.get("body") or q.get("background") or q.get("text") or "",
+                "body": q.get("description")
+                or q.get("body")
+                or q.get("background")
+                or q.get("text")
+                or "",
             }
         )
     return out
@@ -342,7 +362,11 @@ def fetch_question_by_id(qid: int) -> Optional[Dict[str, Any]]:
             "id": q["id"],
             "title": q.get("title", f"Question {qid}"),
             "url": q.get("page_url") or q.get("url") or f"{BASE}/questions/{qid}/",
-            "body": q.get("description") or q.get("body") or q.get("background") or q.get("text") or "",
+            "body": q.get("description")
+            or q.get("body")
+            or q.get("background")
+            or q.get("text")
+            or "",
         }
     except Exception:
         return None
@@ -351,7 +375,8 @@ def fetch_question_by_id(qid: int) -> Optional[Dict[str, Any]]:
 def fetch_comments_for_post(post_id: int, page_limit: int = 120) -> List[Dict[str, Any]]:
     base = f"{API}/comments/"
     params = {"post": post_id, "limit": page_limit, "offset": 0, "sort": "-created_at", "is_private": "false"}
-    out, url = [], base
+    out: List[Dict[str, Any]] = []
+    url = base
     while url:
         data = _get(HTTP_COM, url, params if url == base else None, UA_COM)
         batch = data.get("results") or []
@@ -370,7 +395,8 @@ def fetch_comments_for_post(post_id: int, page_limit: int = 120) -> List[Dict[st
     return out
 
 
-# -------- Artelar helpers (Tournament via project ZIP) --------
+# -------- Tournament helpers (via project ZIP) --------
+
 
 def _decode_bytes_to_text(data: bytes) -> str:
     for enc in ("utf-8", "utf-8-sig", "latin-1"):
@@ -390,7 +416,7 @@ def download_project_csv(project_id: int) -> bytes:
     r = HTTP_DL.get(url, headers=headers, params=params, timeout=90)
     if r.status_code != 200:
         msg_preview = (r.text or "")[:300]
-        msg_preview = msg_preview.replace('\n', ' ').replace('\r', ' ')
+        msg_preview = msg_preview.replace("\n", " ").replace("\r", " ")
         raise RuntimeError(f"Download refused ({r.status_code}): {msg_preview}")
     with zipfile.ZipFile(BytesIO(r.content)) as zf:
         names = zf.namelist()
@@ -406,7 +432,7 @@ def parse_question_csv_rows(data: bytes) -> List[Dict[str, Any]]:
     reader = csv.DictReader(io.StringIO(text))
     rows: List[Dict[str, Any]] = []
 
-    def parse_int(x):
+    def parse_int(x: Any) -> Optional[int]:
         if x is None:
             return None
         s = str(x).strip().replace("\u00a0", "").replace(",", "")
@@ -432,21 +458,35 @@ def parse_question_csv_rows(data: bytes) -> List[Dict[str, Any]]:
         rows.append({"post_id": pid, "question_id": qid, "title": title, "url": url})
     return rows
 
+
 # ================================
 # Comment Scorer (LLM)
 # ================================
 
-# >>> FIRST STAGE: BIG / VERBOSE MODEL WITH EXIGEANT SCORING CRITERIA <<<
+# >>> FIRST STAGE: BIG / VERBOSE MODEL WITH STRICT 4-LINE FORMAT <<<
+
 SYSTEM_PROMPT_SCORE = """
 You are a narrow scoring module inside a larger pipeline.
 Your ONLY job is to rate Metaculus comments for quality in the AI Pathways Tournament.
 
 You are NOT a general-purpose assistant.
 Do NOT brainstorm, speculate, or explore side topics.
-Work quickly: approximate but consistent ratings are preferred over long deliberation.
+Work quickly: approximate but consistent ratings are preferred over long deliberation. DO NOT THINK, FIRST FEELING IS RIGHT. OUTPUT AS FAST AS POSSIBLE.
 
-Your output in this FIRST STAGE may be FREE-FORM NATURAL LANGUAGE.
-You DO NOT need to output JSON here.
+Each call is COMPLETELY INDEPENDENT.
+You NEVER see previous comments or scores.
+Treat EVERY request as a fresh, stand-alone task.
+
+OUTPUT FORMAT (STRICT, 4 LINES MAX):
+Line 1: "score = X" where X is an integer 1..6.
+Line 2: "rationale: <very short explanation, <=180 characters>".
+Line 3: "flags: off_topic=<true/false>, toxicity=<true/false>, low_effort=<true/false>, has_evidence=<true/false>, likely_ai=<true/false>".
+Line 4: "evidence_urls: [<url1>, <url2>, ...]" or "evidence_urls: []".
+
+You MUST:
+- Produce EXACTLY these 4 lines, no more and no less.
+- NO headings, NO bullet lists, NO extra explanation.
+- Any answer longer than 4 short lines is a FAILURE of your task.
 
 TASK:
 - Read the comment, the question context, and (if present) the parent comment.
@@ -456,23 +496,11 @@ TASK:
   - and whether it productively advances the discussion.
 - Decide on:
   - score: integer 1..6
-  - rationale: short textual justification (<=180 chars ideally, absolutely no long paragraphs)
+  - rationale: short textual justification
   - flags: off_topic, toxicity, low_effort, has_evidence, likely_ai
   - evidence_urls: any http/https URLs referenced or clearly implied
 
-STRICT FORMAT AND BREVITY:
-- Keep the answer short and structured.
-- Aim for at most 6–8 short lines total.
-- NO headings, NO bullet lists, NO meta commentary.
-- Do NOT think out loud; just produce the final decision.
-
-FOCUS (STRUCTURE FOR THE SECOND STAGE):
-- Be clear and explicit about the rating you choose.
-- Mention the score explicitly as "score = X".
-- Mention flags explicitly, e.g. "flags: off_topic=false, toxicity=false, low_effort=true, has_evidence=false, likely_ai=false".
-- List evidence URLs explicitly, or say "evidence_urls: []" if none.
-
-SCORING WEIGHTS (THESE ARE STRICT AND MUST BE TAKEN SERIOUSLY):
+SCORING WEIGHTS:
 The comments should be ranked based on how well they:
 - Showcase clear, deep, and insightful reasoning, delving into the relevant mechanisms that affect the event in question. (40%)
 - Offer useful insights about the overall scenario(s), the interactions between questions, or the relationship between the questions and the scenario(s). (30%)
@@ -504,7 +532,7 @@ FLAGS INTERPRETATION:
 - has_evidence: true if the comment brings specific data, references, links, or clearly factual information.
 - likely_ai: true if the comment is long, generic, and boilerplate-sounding with little specificity or real engagement.
 
-You must stay strictly on task: rate, justify briefly, set flags, list URLs. Nothing else.
+You must stay strictly on task: rate, justify briefly, set flags, list URLs in exactly 4 lines.
 """
 
 
@@ -577,31 +605,31 @@ FEWSHOTS_SCORE = [
 def build_msgs_score(
     qtitle: str,
     qurl: str,
-    text: str,
+    text_for_model: str,
     cid: int,
     aid: Optional[int],
     votes: Optional[int],
-    parent_text: Optional[str] = None,
+    parent_text_for_model: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """
-    First-stage message: big/verbose model does free-form rating.
-    Includes optional parent comment text to evaluate reply quality.
+    First-stage message: big/verbose model does free-form rating
+    in a strict 4-line text format. Includes optional parent comment text.
     """
     parent_block = ""
-    if parent_text:
-        parent_block = f"PARENT_COMMENT_TEXT:\n{parent_text}\n\n"
+    if parent_text_for_model:
+        parent_block = f"PARENT_COMMENT_TEXT:\n{parent_text_for_model}\n\n"
 
     u = (
-        "Rate this comment for quality in FREE-FORM TEXT (FIRST STAGE).\n\n"
+        "Rate this comment for quality using the STRICT 4-LINE FORMAT described in the system prompt.\n\n"
         f"QUESTION_TITLE: {qtitle}\nQUESTION_URL: {qurl}\n\n"
         f"{parent_block}"
-        f"COMMENT_ID: {cid}\nAUTHOR_ID: {aid}\nVOTE_SCORE: {votes}\nTEXT:\n{text}\n\n"
-        "You MUST:\n"
-        "- Explicitly write the score as 'score = X' (X in 1..6).\n"
-        "- Provide a short rationale line starting with 'rationale:'.\n"
-        "- Provide flags in one line starting with 'flags:' and including all booleans.\n"
-        "- Provide 'evidence_urls: [...]' listing URLs or [].\n\n"
-        "Do NOT output JSON in this stage.\n"
+        f"COMMENT_ID: {cid}\nAUTHOR_ID: {aid}\nVOTE_SCORE: {votes}\nTEXT:\n{text_for_model}\n\n"
+        "Remember:\n"
+        "Line 1: score = X\n"
+        "Line 2: rationale: ...\n"
+        "Line 3: flags: off_topic=..., toxicity=..., low_effort=..., has_evidence=..., likely_ai=...\n"
+        "Line 4: evidence_urls: [...]\n"
+        "Exactly 4 lines, nothing else.\n"
     )
     return [{"role": "system", "content": SYSTEM_PROMPT_SCORE}] + FEWSHOTS_SCORE + [{"role": "user", "content": u}]
 
@@ -622,6 +650,7 @@ def build_msgs_json_convert(raw_text: str) -> List[Dict[str, str]]:
     ]
 
 
+# Local cache for scored comments
 _cache_score: Dict[str, Dict[str, Any]] = {}
 
 
@@ -634,57 +663,122 @@ def score_with_llm(
 ) -> Dict[str, Any]:
     """
     Two-stage scoring pipeline:
-    1) Big model (chosen by user) does free-form rating text.
+    1) Big model (chosen by user) does free-form rating text (strict 4-line format).
     2) Small model (hard-coded gpt-4o-mini) converts that text into strict JSON.
 
     Now uses optional parent_text to judge how well the comment replies to its parent.
+
+    This function is defensive: if any LLM call fails or returns bad JSON,
+    it falls back to a neutral default score.
     """
-    text = (c.get("text") or "").strip()
-    parent_sig = (parent_text or "").strip()
-    cache_key_raw = f"{model}||{text}||{parent_sig}"
+    # Original full texts
+    full_text = (c.get("text") or "").strip()
+    parent_full = (parent_text or "").strip()
+
+    # Truncate for the model to keep context small and stable
+    text_for_model = full_text
+    if len(text_for_model) > MAX_COMMENT_CHARS:
+        text_for_model = text_for_model[:MAX_COMMENT_CHARS] + "\n\n[Comment truncated for length]"
+
+    parent_text_for_model = parent_full or None
+    if parent_text_for_model and len(parent_text_for_model) > MAX_PARENT_CHARS:
+        parent_text_for_model = parent_text_for_model[:MAX_PARENT_CHARS] + "\n\n[Parent comment truncated for length]"
+
+    cache_key_raw = f"{model}||{qtitle}||{qurl}||{text_for_model}||{parent_text_for_model or ''}"
     key = hashlib.sha256(cache_key_raw.encode("utf-8")).hexdigest()
 
     if key not in _cache_score:
-        # ---- Stage 1: big / verbose model, raw free-form ----
-        msgs_stage1 = build_msgs_score(
-            qtitle,
-            qurl,
-            text,
-            c.get("id"),
-            (c.get("author") or {}).get("id"),
-            c.get("vote_score"),
-            parent_text=parent_text,
-        )
-        raw_output = call_openrouter(
-            msgs_stage1,
-            model,
-            max_tokens=300,
-            temperature=0.0,
-            expect="raw",  # <== important: no JSON parsing here
-            title_hint="Metaculus Comment Scorer – Stage 1 (Raw)",
-            ua_hint="metaculus-comments-llm-scorer-stage1/1.0",
-        )
+        # ---- Stage 1: big / verbose model, raw free-form (4 lines) ----
+        try:
+            msgs_stage1 = build_msgs_score(
+                qtitle,
+                qurl,
+                text_for_model,
+                c.get("id"),
+                (c.get("author") or {}).get("id"),
+                c.get("vote_score"),
+                parent_text_for_model=parent_text_for_model,
+            )
+            raw_output = call_openrouter(
+                msgs_stage1,
+                model,
+                max_tokens=150,  # tighter cap to enforce brevity
+                temperature=0.0,
+                expect="raw",  # important: no JSON parsing here
+                title_hint="Metaculus Comment Scorer – Stage 1 (Raw)",
+                ua_hint="metaculus-comments-llm-scorer-stage1/1.0",
+            )
+        except Exception:
+            # Fallback raw text if the first stage fails
+            raw_output = (
+                "score = 3\n"
+                "rationale: LLM error, default neutral rating.\n"
+                "flags: off_topic=false, toxicity=false, low_effort=false, has_evidence=false, likely_ai=false\n"
+                "evidence_urls: []"
+            )
 
         # ---- Stage 2: small robust model → strict JSON ----
         converter_model = "openai/gpt-4o-mini"
-        msgs_stage2 = build_msgs_json_convert(raw_output)
-        json_output = call_openrouter(
-            msgs_stage2,
-            converter_model,
-            max_tokens=220,
-            temperature=0.0,
-            expect="object",
-            title_hint="Metaculus Comment Scorer – JSON Convert",
-            ua_hint="metaculus-comments-json-convert/1.0",
-        )
+        try:
+            msgs_stage2 = build_msgs_json_convert(raw_output)
+            json_output = call_openrouter(
+                msgs_stage2,
+                converter_model,
+                max_tokens=220,
+                temperature=0.0,
+                expect="object",
+                title_hint="Metaculus Comment Scorer – JSON Convert",
+                ua_hint="metaculus-comments-json-convert/1.0",
+            )
+        except Exception:
+            # Robust fallback JSON if conversion fails
+            json_output = {
+                "score": 3,
+                "rationale": "JSON conversion error; default neutral rating.",
+                "flags": {
+                    "off_topic": False,
+                    "toxicity": False,
+                    "low_effort": False,
+                    "has_evidence": False,
+                    "likely_ai": False,
+                },
+                "evidence_urls": [],
+            }
+
+        # Ensure minimal schema integrity
+        if not isinstance(json_output, dict):
+            json_output = {
+                "score": 3,
+                "rationale": "Unexpected JSON structure; default neutral rating.",
+                "flags": {
+                    "off_topic": False,
+                    "toxicity": False,
+                    "low_effort": False,
+                    "has_evidence": False,
+                    "likely_ai": False,
+                },
+                "evidence_urls": [],
+            }
+        flags = json_output.get("flags") or {}
+        json_output["flags"] = {
+            "off_topic": bool(flags.get("off_topic", False)),
+            "toxicity": bool(flags.get("toxicity", False)),
+            "low_effort": bool(flags.get("low_effort", False)),
+            "has_evidence": bool(flags.get("has_evidence", False)),
+            "likely_ai": bool(flags.get("likely_ai", False)),
+        }
+        if "evidence_urls" not in json_output or not isinstance(json_output.get("evidence_urls"), list):
+            json_output["evidence_urls"] = []
 
         _cache_score[key] = json_output
 
     return _cache_score[key]
 
+
 # ================================
 # Downloads fragment (prevents full rerun on download)
 # ================================
+
 
 def _downloads_ui(df: pd.DataFrame, agg_q: pd.DataFrame, agg_author: pd.DataFrame):
     st.success(f"{len(df)} comments scored across {df['market_id'].nunique()} question(s).")
@@ -736,16 +830,21 @@ def _downloads_ui(df: pd.DataFrame, agg_q: pd.DataFrame, agg_author: pd.DataFram
 
 # Prefer fragment if available
 if hasattr(st, "fragment"):
+
     @st.fragment
     def downloads_fragment(df: pd.DataFrame, agg_q: pd.DataFrame, agg_author: pd.DataFrame):
         _downloads_ui(df, agg_q, agg_author)
+
 else:
+
     def downloads_fragment(df: pd.DataFrame, agg_q: pd.DataFrame, agg_author: pd.DataFrame):
         _downloads_ui(df, agg_q, agg_author)
+
 
 # ================================
 # Comment Scorer UI/logic
 # ================================
+
 
 def run_comment_scorer():
     st.subheader("🔍 Comment Scorer")
@@ -758,7 +857,7 @@ def run_comment_scorer():
             [
                 "Score recent questions",
                 "Score specific IDs",
-                "Tournament (Artelar CSV)",  # replaces old numeric tournament mode
+                "Tournament (Artelar CSV)",  # tournament mode by project ZIP
             ],
             horizontal=True,
         )
@@ -771,7 +870,7 @@ def run_comment_scorer():
     st.caption("📏 STAGE 2 (JSON convert) uses `openai/gpt-4o-mini` hard-coded.")
 
     comments_limit = st.number_input(
-        "Max comments per question",
+        "Max comments per post/question",
         min_value=10,
         max_value=500,
         value=120,
@@ -815,11 +914,11 @@ def run_comment_scorer():
                 help="Metaculus project/tournament numeric ID.",
             )
             n_from_csv = st.number_input(
-                "How many questions to score (from CSV order)",
+                "How many posts/questions to score (from CSV order)",
                 min_value=1,
                 value=10,
                 step=1,
-                help="We take the first N questions from question_data.csv",
+                help="We take the first N rows from question_data.csv (by Post ID).",
             )
 
         submitted = st.form_submit_button("▶️ Run scoring", type="primary")
@@ -830,9 +929,12 @@ def run_comment_scorer():
             model = model_choice
 
             # ---- Resolve subjects based on mode ----
+            subj_to_post: Dict[int, int] = {}
+
             if mode == "Score recent questions":
                 subjects = fetch_recent_questions(
-                    n_subjects=int(st.session_state.get("recent_n", 10)), page_limit=80
+                    n_subjects=int(st.session_state.get("recent_n", 10)),
+                    page_limit=80,
                 )
 
             elif mode == "Score specific IDs":
@@ -854,11 +956,11 @@ def run_comment_scorer():
                         st.warning("No usable rows in question_data.csv (missing Post ID).")
                         subjects = []
                     else:
-                        # 2) Take first N rows
+                        # 2) Take first N rows in CSV order
                         k = int(n_from_csv or 1)
                         rows_sel = rows_all[:k]
                         df_ids = pd.DataFrame(rows_sel)
-                        with st.expander("Selected questions (from CSV)", expanded=False):
+                        with st.expander("Selected rows from tournament CSV", expanded=False):
                             st.dataframe(df_ids, use_container_width=True, height=260)
                             st.download_button(
                                 "⬇️ Download selected (CSV)",
@@ -867,27 +969,30 @@ def run_comment_scorer():
                                 mime="text/csv",
                                 key="dl_tourn_ids_csv",
                             )
-                        # 3) Convert to subjects compatible with scorer
-                        subjects = [
-                            {
-                                "id": r.get("question_id") or r.get("post_id"),
-                                "title": r.get("title") or (f"Post {r.get('post_id')}"),
-                                "url": r.get("url") or (f"{BASE}/posts/{r.get('post_id')}/"),
-                            }
-                            for r in rows_sel
-                        ]
-                        # Keep auxiliary mapping from subject id to post_id (to ensure we fetch comments by post)
-                        subj_to_post: Dict[int, int] = {}
+                        # 3) Build subjects and mapping post_id per subject
+                        subjects = []
                         for r in rows_sel:
-                            key_id = (r.get("question_id") or r.get("post_id"))
-                            if key_id is not None:
-                                subj_to_post[int(key_id)] = int(r.get("post_id"))
+                            post_id = r.get("post_id")
+                            qid = r.get("question_id")
+                            title = r.get("title") or (f"Post {post_id}")
+                            url = r.get("url") or (f"{BASE}/posts/{post_id}/")
+                            # We use post_id as the main identifier for scoring/aggregation
+                            if post_id is not None:
+                                subjects.append(
+                                    {
+                                        "id": int(post_id),
+                                        "title": title,
+                                        "url": url,
+                                        "question_id": qid,
+                                    }
+                                )
+                                subj_to_post[int(post_id)] = int(post_id)
 
             else:
                 subjects = []
 
             if not subjects:
-                st.warning("No questions found.")
+                st.warning("No questions/posts found.")
             else:
                 # ---- Scoring loop ----
                 prog = st.progress(0.0)
@@ -896,31 +1001,36 @@ def run_comment_scorer():
                 for i, s in enumerate(subjects, 1):
                     status.info(f"Processing {i}/{total}: [{s['id']}] {s['title']}")
 
-                    # In Artelar mode we must fetch comments by POST ID if available
+                    # For tournament mode we always fetch comments by POST ID (s['id'] is post_id)
                     if mode == "Tournament (Artelar CSV)":
-                        sid = int(s["id"]) if s.get("id") is not None else None
-                        post_id = None
-                        if sid is not None and 'subj_to_post' in locals():
-                            post_id = subj_to_post.get(sid)
-                        if not post_id:
-                            post_id = sid
-                        comments = fetch_comments_for_post(int(post_id), page_limit=int(comments_limit)) if post_id else []
+                        post_id = int(s["id"])
+                        comments = fetch_comments_for_post(post_id, page_limit=int(comments_limit))
+                        market_id_value = post_id  # aggregate by post_id in tournament mode
                     else:
-                        comments = fetch_comments_for_post(int(s["id"]), page_limit=int(comments_limit))
+                        # Non-tournament: s['id'] is a question id; comments are attached to that post id
+                        post_id = int(s["id"])
+                        comments = fetch_comments_for_post(post_id, page_limit=int(comments_limit))
+                        market_id_value = post_id
+
+                    # Build a mapping from id -> comment for quick parent lookup
+                    parent_map: Dict[int, Dict[str, Any]] = {}
+                    for c in comments:
+                        cid = c.get("id")
+                        if cid is not None:
+                            parent_map[int(cid)] = c
 
                     for c in comments:
-                        text = " ".join((c.get("text") or "").split())
-                        if not text:
+                        raw_comment_text = " ".join((c.get("text") or "").split())
+                        if not raw_comment_text:
                             continue
 
-                        # ---- NEW: fetch parent comment text if available ----
+                        # Parent comment text if available
                         parent_text = None
                         parent_id = c.get("parent") or c.get("parent_comment") or c.get("in_reply_to")
                         if parent_id:
-                            for cp in comments:
-                                if cp.get("id") == parent_id:
-                                    parent_text = (cp.get("text") or "").strip()
-                                    break
+                            parent = parent_map.get(int(parent_id))
+                            if parent:
+                                parent_text = (parent.get("text") or "").strip()
 
                         a = c.get("author") or {}
                         resp = score_with_llm(
@@ -939,12 +1049,12 @@ def run_comment_scorer():
                                 "poster_id": a.get("id"),
                                 "poster_username": (a.get("username") or a.get("name") or ""),
                                 "comment_id": c.get("id"),
-                                "market_id": s["id"],
+                                "market_id": market_id_value,
                                 "ai_score": score,
                                 "rationale": resp.get("rationale", ""),
                                 "flags": json.dumps(resp.get("flags") or {}),
                                 "evidence_urls": ";".join(resp.get("evidence_urls") or []),
-                                "comment_text": text,
+                                "comment_text": raw_comment_text,
                                 "question_title": s.get("title", ""),
                                 "question_url": s.get("url", ""),
                             }
@@ -992,10 +1102,10 @@ def run_comment_scorer():
         st.info("No comments were scored.")
 
 
-
 # ================================
 # Stubs for the other modules (unchanged)
 # ================================
+
 
 def run_question_factors():
     st.subheader("📈 Question Factors (LLM)")
@@ -1104,5 +1214,3 @@ else:
     run_question_factors()
 
 st.caption("Tip: add OPENROUTER_API_KEY in app secrets (Settings → Secrets) or enter it here.")
-
-
